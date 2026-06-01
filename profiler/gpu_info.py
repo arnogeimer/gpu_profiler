@@ -1,0 +1,63 @@
+import io
+import json
+from pathlib import Path
+
+import torch
+
+
+# CUDA cores per SM, indexed by compute capability (major, minor)
+_CUDA_CORES_PER_SM = {
+    (3, 0): 192, (3, 5): 192, (3, 7): 192,
+    (5, 0): 128, (5, 2): 128, (5, 3): 128,
+    (6, 0): 64,  (6, 1): 128, (6, 2): 128,
+    (7, 0): 64,  (7, 2): 64,  (7, 5): 64,
+    (8, 0): 64,  (8, 6): 128, (8, 7): 128, (8, 9): 128,
+    (9, 0): 128,
+    (10, 0): 128,
+}
+
+
+def get_gpu_name() -> str:
+    try:
+        name = torch.cuda.get_device_name(0)
+    except Exception:
+        name = "unknown_gpu"
+    return name.replace(" ", "_")
+
+
+def collect() -> dict:
+    info = {}
+    try:
+        props = torch.cuda.get_device_properties(0)
+        cc = (props.major, props.minor)
+        cores_per_sm = _CUDA_CORES_PER_SM.get(cc)
+        info.update({
+            "name": props.name,
+            "compute_capability": f"{props.major}.{props.minor}",
+            "sm_count": props.multi_processor_count,
+            "cores_per_sm": cores_per_sm,
+            "cuda_cores": props.multi_processor_count * cores_per_sm if cores_per_sm else None,
+            "vram_total_mb": props.total_memory // (1024 ** 2),
+            "l2_cache_kb": props.L2_cache_size // 1024 if hasattr(props, "L2_cache_size") else None,
+        })
+    except Exception:
+        pass
+    return info
+
+
+def save(output_path: Path) -> None:
+    output_path.write_text(json.dumps(collect(), indent=2))
+
+
+def upload_to_hf(token: str, repo_id: str, gpu_name: str) -> None:
+    """Push the collected GPU info JSON to a HuggingFace dataset repo."""
+    from huggingface_hub import create_repo, upload_file
+    create_repo(repo_id, repo_type="dataset", token=token, exist_ok=True, private=True)
+    payload = json.dumps(collect(), indent=2).encode("utf-8")
+    upload_file(
+        path_or_fileobj=io.BytesIO(payload),
+        repo_id=repo_id,
+        path_in_repo=f"{gpu_name}/gpu_info.json",
+        token=token,
+        repo_type="dataset",
+    )

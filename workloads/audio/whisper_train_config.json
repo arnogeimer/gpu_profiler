@@ -1,0 +1,488 @@
+[
+    {
+        "model": "small",
+        "sample_length": 5,
+        "batch_size": 1,
+        "precision": "fp16"
+    },
+    {
+        "model": "small",
+        "sample_length": 5,
+        "batch_size": 1,
+        "precision": "bf16"
+    },
+    {
+        "model": "small",
+        "sample_length": 5,
+        "batch_size": 1,
+        "precision": "fp32"
+    },
+    {
+        "model": "small",
+        "sample_length": 5,
+        "batch_size": 2,
+        "precision": "fp16"
+    },
+    {
+        "model": "small",
+        "sample_length": 5,
+        "batch_size": 2,
+        "precision": "bf16"
+    },
+    {
+        "model": "small",
+        "sample_length": 5,
+        "batch_size": 2,
+        "precision": "fp32"
+    },
+    {
+        "model": "small",
+        "sample_length": 5,
+        "batch_size": 4,
+        "precision": "fp16"
+    },
+    {
+        "model": "small",
+        "sample_length": 5,
+        "batch_size": 4,
+        "precision": "bf16"
+    },
+    {
+        "model": "small",
+        "sample_length": 5,
+        "batch_size": 4,
+        "precision": "fp32"
+    },
+    {
+        "model": "small",
+        "sample_length": 15,
+        "batch_size": 1,
+        "precision": "fp16"
+    },
+    {
+        "model": "small",
+        "sample_length": 15,
+        "batch_size": 1,
+        "precision": "bf16"
+    },
+    {
+        "model": "small",
+        "sample_length": 15,
+        "batch_size": 1,
+        "precision": "fp32"
+    },
+    {
+        "model": "small",
+        "sample_length": 15,
+        "batch_size": 2,
+        "precision": "fp16"
+    },
+    {
+        "model": "small",
+        "sample_length": 15,
+        "batch_size": 2,
+        "precision": "bf16"
+    },
+    {
+        "model": "small",
+        "sample_length": 15,
+        "batch_size": 2,
+        "precision": "fp32"
+    },
+    {
+        "model": "small",
+        "sample_length": 15,
+        "batch_size": 4,
+        "precision": "fp16"
+    },
+    {
+        "model": "small",
+        "sample_length": 15,
+        "batch_size": 4,
+        "precision": "bf16"
+    },
+    {
+        "model": "small",
+        "sample_length": 15,
+        "batch_size": 4,
+        "precision": "fp32"
+    },
+    {
+        "model": "small",
+        "sample_length": 30,
+        "batch_size": 1,
+        "precision": "fp16"
+    },
+    {
+        "model": "small",
+        "sample_length": 30,
+        "batch_size": 1,
+        "precision": "bf16"
+    },
+    {
+        "model": "small",
+        "sample_length": 30,
+        "batch_size": 1,
+        "precision": "fp32"
+    },
+    {
+        "model": "small",
+        "sample_length": 30,
+        "batch_size": 2,
+        "precision": "fp16"
+    },
+    {
+        "model": "small",
+        "sample_length": 30,
+        "batch_size": 2,
+        "precision": "bf16"
+    },
+    {
+        "model": "small",
+        "sample_length": 30,
+        "batch_size": 2,
+        "precision": "fp32"
+    },
+    {
+        "model": "small",
+        "sample_length": 30,
+        "batch_size": 4,
+        "precision": "fp16"
+    },
+    {
+        "model": "small",
+        "sample_length": 30,
+        "batch_size": 4,
+        "precision": "bf16"
+    },
+    {
+        "model": "small",
+        "sample_length": 30,
+        "batch_size": 4,
+        "precision": "fp32"
+    },
+    {
+        "model": "medium",
+        "sample_length": 5,
+        "batch_size": 1,
+        "precision": "fp16"
+    },
+    {
+        "model": "medium",
+        "sample_length": 5,
+        "batch_size": 1,
+        "precision": "bf16"
+    },
+    {
+        "model": "medium",
+        "sample_length": 5,
+        "batch_size": 1,
+        "precision": "fp32"
+    },
+    {
+        "model": "medium",
+        "sample_length": 5,
+        "batch_size": 2,
+        "precision": "fp16"
+    },
+    {
+        "model": "medium",
+        "sample_length": 5,
+        "batch_size": 2,
+        "precision": "bf16"
+    },
+    {
+        "model": "medium",
+        "sample_length": 5,
+        "batch_size": 2,
+        "precision": "fp32"
+    },
+    {
+        "model": "medium",
+        "sample_length": 5,
+        "batch_size": 4,
+        "precision": "fp16"
+    },
+    {
+        "model": "medium",
+        "sample_length": 5,
+        "batch_size": 4,
+        "precision": "bf16"
+    },
+    {
+        "model": "medium",
+        "sample_length": 5,
+        "batch_size": 4,
+        "precision": "fp32"
+    },
+    {
+        "model": "medium",
+        "sample_length": 15,
+        "batch_size": 1,
+        "precision": "fp16"
+    },
+    {
+        "model": "medium",
+        "sample_length": 15,
+        "batch_size": 1,
+        "precision": "bf16"
+    },
+    {
+        "model": "medium",
+        "sample_length": 15,
+        "batch_size": 1,
+        "precision": "fp32"
+    },
+    {
+        "model": "medium",
+        "sample_length": 15,
+        "batch_size": 2,
+        "precision": "fp16"
+    },
+    {
+        "model": "medium",
+        "sample_length": 15,
+        "batch_size": 2,
+        "precision": "bf16"
+    },
+    {
+        "model": "medium",
+        "sample_length": 15,
+        "batch_size": 2,
+        "precision": "fp32"
+    },
+    {
+        "model": "medium",
+        "sample_length": 15,
+        "batch_size": 4,
+        "precision": "fp16"
+    },
+    {
+        "model": "medium",
+        "sample_length": 15,
+        "batch_size": 4,
+        "precision": "bf16"
+    },
+    {
+        "model": "medium",
+        "sample_length": 15,
+        "batch_size": 4,
+        "precision": "fp32"
+    },
+    {
+        "model": "medium",
+        "sample_length": 30,
+        "batch_size": 1,
+        "precision": "fp16"
+    },
+    {
+        "model": "medium",
+        "sample_length": 30,
+        "batch_size": 1,
+        "precision": "bf16"
+    },
+    {
+        "model": "medium",
+        "sample_length": 30,
+        "batch_size": 1,
+        "precision": "fp32"
+    },
+    {
+        "model": "medium",
+        "sample_length": 30,
+        "batch_size": 2,
+        "precision": "fp16"
+    },
+    {
+        "model": "medium",
+        "sample_length": 30,
+        "batch_size": 2,
+        "precision": "bf16"
+    },
+    {
+        "model": "medium",
+        "sample_length": 30,
+        "batch_size": 2,
+        "precision": "fp32"
+    },
+    {
+        "model": "medium",
+        "sample_length": 30,
+        "batch_size": 4,
+        "precision": "fp16"
+    },
+    {
+        "model": "medium",
+        "sample_length": 30,
+        "batch_size": 4,
+        "precision": "bf16"
+    },
+    {
+        "model": "medium",
+        "sample_length": 30,
+        "batch_size": 4,
+        "precision": "fp32"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 5,
+        "batch_size": 1,
+        "precision": "fp16"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 5,
+        "batch_size": 1,
+        "precision": "bf16"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 5,
+        "batch_size": 1,
+        "precision": "fp32"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 5,
+        "batch_size": 2,
+        "precision": "fp16"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 5,
+        "batch_size": 2,
+        "precision": "bf16"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 5,
+        "batch_size": 2,
+        "precision": "fp32"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 5,
+        "batch_size": 4,
+        "precision": "fp16"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 5,
+        "batch_size": 4,
+        "precision": "bf16"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 5,
+        "batch_size": 4,
+        "precision": "fp32"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 15,
+        "batch_size": 1,
+        "precision": "fp16"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 15,
+        "batch_size": 1,
+        "precision": "bf16"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 15,
+        "batch_size": 1,
+        "precision": "fp32"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 15,
+        "batch_size": 2,
+        "precision": "fp16"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 15,
+        "batch_size": 2,
+        "precision": "bf16"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 15,
+        "batch_size": 2,
+        "precision": "fp32"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 15,
+        "batch_size": 4,
+        "precision": "fp16"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 15,
+        "batch_size": 4,
+        "precision": "bf16"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 15,
+        "batch_size": 4,
+        "precision": "fp32"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 30,
+        "batch_size": 1,
+        "precision": "fp16"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 30,
+        "batch_size": 1,
+        "precision": "bf16"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 30,
+        "batch_size": 1,
+        "precision": "fp32"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 30,
+        "batch_size": 2,
+        "precision": "fp16"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 30,
+        "batch_size": 2,
+        "precision": "bf16"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 30,
+        "batch_size": 2,
+        "precision": "fp32"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 30,
+        "batch_size": 4,
+        "precision": "fp16"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 30,
+        "batch_size": 4,
+        "precision": "bf16"
+    },
+    {
+        "model": "large-v3",
+        "sample_length": 30,
+        "batch_size": 4,
+        "precision": "fp32"
+    }
+]

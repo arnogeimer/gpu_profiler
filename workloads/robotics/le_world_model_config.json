@@ -1,0 +1,6 @@
+[
+  {"dataset": "pusht",   "batch_size": 32, "context_length": 8,  "precision": "fp32"},
+  {"dataset": "pusht",   "batch_size": 64, "context_length": 8,  "precision": "fp16"},
+  {"dataset": "cube",    "batch_size": 32, "context_length": 8,  "precision": "fp32"},
+  {"dataset": "reacher", "batch_size": 32, "context_length": 16, "precision": "fp32"}
+]

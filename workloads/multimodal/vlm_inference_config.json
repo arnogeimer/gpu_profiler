@@ -1,0 +1,6 @@
+[
+  {"model": "llava-hf/llava-1.5-7b-hf",    "dataset": "vqav2",         "batch_size": 4, "max_new_tokens": 64,  "precision": "fp16"},
+  {"model": "llava-hf/llava-1.5-7b-hf",    "dataset": "vqav2",         "batch_size": 4, "max_new_tokens": 64,  "precision": "int4"},
+  {"model": "google/paligemma-3b-pt-224",   "dataset": "vqav2",         "batch_size": 8, "max_new_tokens": 64,  "precision": "fp16"},
+  {"model": "google/paligemma-3b-pt-224",   "dataset": "coco-captions",  "batch_size": 8, "max_new_tokens": 128, "precision": "fp16"}
+]

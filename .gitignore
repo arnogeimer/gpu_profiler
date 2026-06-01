@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.python-version
+
+# Docker (local-only deployment files, not part of the code)
+Dockerfile
+.dockerignore
+
+# Generated outputs
+results/
+**/NVIDIA_*_metrics.csv
+**/NVIDIA_*_smi.csv
+**/NVIDIA_*_smi/
+
+# Local notes / scratch
+gpus.txt

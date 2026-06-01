@@ -1,0 +1,6 @@
+[
+  {"model": "meta-llama/Llama-3.1-8B", "dataset": "alpaca",    "lora_rank": 16, "lora_alpha": 32, "batch_size": 4, "precision": "bf16", "grad_accumulation_steps": 4},
+  {"model": "meta-llama/Llama-3.1-8B", "dataset": "alpaca",    "lora_rank": 32, "lora_alpha": 64, "batch_size": 4, "precision": "bf16", "grad_accumulation_steps": 4},
+  {"model": "meta-llama/Llama-3.1-8B", "dataset": "dolly-15k", "lora_rank": 16, "lora_alpha": 32, "batch_size": 4, "precision": "bf16", "grad_accumulation_steps": 4},
+  {"model": "microsoft/Phi-3-mini-4k-instruct", "dataset": "alpaca", "lora_rank": 16, "lora_alpha": 32, "batch_size": 8, "precision": "bf16", "grad_accumulation_steps": 2}
+]
