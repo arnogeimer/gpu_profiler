@@ -42,6 +42,27 @@ def collect() -> dict:
         })
     except Exception:
         pass
+
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        for key, fn in [
+            ("power_limit_w",         lambda: pynvml.nvmlDeviceGetPowerManagementLimit(h) / 1000.0),
+            ("max_graphics_clock_mhz", lambda: pynvml.nvmlDeviceGetMaxClockInfo(h, pynvml.NVML_CLOCK_GRAPHICS)),
+            ("max_sm_clock_mhz",       lambda: pynvml.nvmlDeviceGetMaxClockInfo(h, pynvml.NVML_CLOCK_SM)),
+            ("max_memory_clock_mhz",   lambda: pynvml.nvmlDeviceGetMaxClockInfo(h, pynvml.NVML_CLOCK_MEM)),
+            ("driver_version",         lambda: pynvml.nvmlSystemGetDriverVersion()),
+        ]:
+            try:
+                v = fn()
+                info[key] = v.decode() if isinstance(v, bytes) else v
+            except Exception:
+                pass
+        pynvml.nvmlShutdown()
+    except Exception:
+        pass
+
     return info
 
 

@@ -155,7 +155,7 @@ def run(hyperparams: Hyperparams) -> dict:
     }
 
 
-ONLY_MODELS = {"resnet18"}  # set to None to run all
+ONLY_MODELS = None  # set to a set/list of names to filter; None = run all configs
 
 if __name__ == "__main__":
     config_path = Path(__file__).parent / "classification_train_config.json"
