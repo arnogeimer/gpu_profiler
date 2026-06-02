@@ -1,8 +1,6 @@
-import csv
 import threading
 import time
 from dataclasses import asdict, dataclass, field, is_dataclass
-from pathlib import Path
 
 import torch
 
@@ -29,23 +27,17 @@ _SUMMARY_KEYS = [
 ]
 
 
-def record_run(csv_path: Path, hp, phase: str, metrics: dict | None = None,
-               error: str = "", avg_ms: float | None = None) -> None:
-    """Append one row to the workload CSV with config + phase + monitor summary / error."""
+def build_row(hp, phase: str, metrics: dict | None = None,
+              error: str = "", avg_ms: float | None = None) -> dict:
+    """Build one result row from config + phase + monitor summary / error. No I/O."""
     config = asdict(hp) if is_dataclass(hp) else dict(hp)
-    row = {
+    return {
         **config,
         "phase": phase,
         "error": error,
-        "avg_time_ms": "" if avg_ms is None else avg_ms,
-        **{k: "" if metrics is None else metrics.get(k, "") for k in _SUMMARY_KEYS},
+        "avg_time_ms": None if avg_ms is None else avg_ms,
+        **{k: None if metrics is None else metrics.get(k) for k in _SUMMARY_KEYS},
     }
-    file_exists = csv_path.exists()
-    with open(csv_path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row)
 
 
 @dataclass
