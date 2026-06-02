@@ -166,5 +166,9 @@ if __name__ == "__main__":
                 print(f"SKIP ({metrics['error']}): {params}")
         except torch.cuda.OutOfMemoryError:
             print(f"OOM: {params}")
+        except Exception as e:
+            # Catches cuBLAS/cuDNN errors, plain RuntimeErrors from OOM-adjacent failures,
+            # NaN crashes, etc. Don't let one bad config kill the whole sweep.
+            print(f"FAIL ({type(e).__name__}): {params} - {e}")
         finally:
             torch.cuda.empty_cache()
