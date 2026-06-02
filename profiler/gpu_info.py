@@ -25,6 +25,38 @@ def get_gpu_name() -> str:
     return name.replace(" ", "_")
 
 
+def _measure_tflops(dtype: torch.dtype, n: int = 8192, iters: int = 10, warmup: int = 3) -> float | None:
+    """Time a large square matmul to estimate achieved TFLOPS for the given dtype.
+    fp32 routes through CUDA cores; fp16/bf16 routes through Tensor Cores (Volta+)."""
+    A = B = C = None
+    try:
+        A = torch.randn(n, n, device="cuda", dtype=dtype)
+        B = torch.randn(n, n, device="cuda", dtype=dtype)
+        for _ in range(warmup):
+            C = A @ B
+        torch.cuda.synchronize()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iters):
+            C = A @ B
+        end.record()
+        torch.cuda.synchronize()
+
+        elapsed_s = start.elapsed_time(end) / 1000.0
+        flops = 2.0 * (n ** 3) * iters
+        return flops / elapsed_s / 1e12
+    except Exception:
+        return None
+    finally:
+        del A, B, C
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
 def collect() -> dict:
     info = {}
     try:
@@ -62,6 +94,10 @@ def collect() -> dict:
         pynvml.nvmlShutdown()
     except Exception:
         pass
+
+    if torch.cuda.is_available():
+        info["measured_tflops_fp32"] = _measure_tflops(torch.float32)
+        info["measured_tflops_fp16"] = _measure_tflops(torch.float16)
 
     return info
 

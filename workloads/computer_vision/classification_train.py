@@ -17,20 +17,18 @@ TIMED_BATCHES = 20
 
 _DATASET_CFG = {
     "32x32":   {"img_size": 32},
-    "128x128": {"img_size": 128},
     "224x224": {"img_size": 224},
 }
 
 _PRECISION = {
     "fp16": torch.float16,
-    "bf16": torch.bfloat16,
     "fp32": torch.float32,
 }
 
 
 @dataclass
 class Hyperparams:
-    model: str = "resnet50"    # timm model name
+    model: str = "resnet18"    # timm model name
     dataset: str = "32x32"  # 32x32 | 128x128 | 224x224
     batch_size: int = 64
     precision: str = "fp16"    # fp32 | fp16 | bf16
