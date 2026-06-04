@@ -176,7 +176,6 @@ MODELS = [
     'Qwen/Qwen2.5-0.5B',
     # tier 2 (~1-1.7B)
     'EleutherAI/pythia-1b',
-    'bigcode/starcoderbase-1b',
     'TinyLlama/TinyLlama-1.1B-Chat-v1.0',
     'bigscience/bloom-1b1',
     'microsoft/phi-1_5',
@@ -185,10 +184,16 @@ MODELS = [
     'Qwen/Qwen2.5-Coder-1.5B',
     'stabilityai/stablelm-2-1_6b',
     'HuggingFaceTB/SmolLM2-1.7B',
-    # tier 3 (~2.7-3.8B)
+    # tier 3 (~2.8-3.8B)
+    'EleutherAI/pythia-2.8b',
     'microsoft/phi-2',
     'Qwen/Qwen2.5-3B',
     'microsoft/Phi-3-mini-4k-instruct',
+    'microsoft/Phi-3.5-mini-instruct',
+    # tier 4 (~7B)
+    'HuggingFaceH4/zephyr-7b-beta',
+    'Qwen/Qwen2.5-7B',
+    'Qwen/Qwen2.5-Coder-7B',
 ]
 SEQUENCE_LENGTHS = [256, 512]
 BATCH_SIZES = [1, 2, 4]
