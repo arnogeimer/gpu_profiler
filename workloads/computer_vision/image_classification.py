@@ -165,13 +165,15 @@ BATCH_SIZES = [16, 32, 64]
 PRECISIONS = ['fp32', 'fp16']
 
 
+UPLOAD_EVERY_N_MODELS = 20
+
+
 def run_all(upload_fn: Optional[Callable[[pd.DataFrame], None]] = None,
             only_models: Optional[set] = None) -> pd.DataFrame:
-    """Iterate every config; after each model is finished, call upload_fn(current DataFrame)."""
+    """Iterate every config; upload after every N models and once at the end."""
     all_rows: list[dict] = []
-    for model in MODELS:
-        if only_models is not None and model not in only_models:
-            continue
+    selected = [m for m in MODELS if only_models is None or m in only_models]
+    for i, model in enumerate(selected):
         for img_size, batch_size, precision in product(IMG_SIZES, BATCH_SIZES, PRECISIONS):
             params = {"model": model, "img_size": img_size, "batch_size": batch_size, "precision": precision}
             try:
@@ -183,7 +185,9 @@ def run_all(upload_fn: Optional[Callable[[pd.DataFrame], None]] = None,
             finally:
                 torch.cuda.empty_cache()
 
-        if upload_fn:
+        is_milestone = (i + 1) % UPLOAD_EVERY_N_MODELS == 0
+        is_last = i == len(selected) - 1
+        if upload_fn and (is_milestone or is_last):
             try:
                 upload_fn(pd.DataFrame(all_rows))
             except Exception as e:

@@ -1,6 +1,0 @@
-[
-  {"model": "runwayml/stable-diffusion-v1-5",          "num_inference_steps": 20, "image_size": 512,  "batch_size": 1, "precision": "fp16"},
-  {"model": "runwayml/stable-diffusion-v1-5",          "num_inference_steps": 20, "image_size": 512,  "batch_size": 4, "precision": "fp16"},
-  {"model": "stabilityai/sdxl-turbo",                  "num_inference_steps": 4,  "image_size": 1024, "batch_size": 1, "precision": "fp16"},
-  {"model": "black-forest-labs/FLUX.1-schnell",        "num_inference_steps": 4,  "image_size": 1024, "batch_size": 1, "precision": "fp16"}
-]

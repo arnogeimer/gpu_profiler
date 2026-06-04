@@ -144,30 +144,40 @@ def run(hyperparams: Hyperparams) -> list[dict]:
 
 
 MODELS = [
+    # small (<50M)
+    'ntu-spml/distilhubert',
+    'asapp/sew-d-tiny-100k',
+    'asapp/sew-tiny-100k',
+    # mid (~80M)
+    'asapp/sew-d-mid-100k',
+    # base (~94M)
     'facebook/wav2vec2-base',
-    'facebook/wav2vec2-large',
-    'facebook/wav2vec2-xls-r-300m',
     'facebook/hubert-base-ls960',
-    'facebook/hubert-large-ls960-ft',
     'microsoft/wavlm-base',
     'microsoft/wavlm-base-plus',
-    'microsoft/wavlm-large',
     'facebook/data2vec-audio-base',
-    'facebook/data2vec-audio-large',
     'microsoft/unispeech-sat-base',
+    # large (~315M)
+    'facebook/wav2vec2-large',
+    'facebook/wav2vec2-xls-r-300m',
+    'facebook/hubert-large-ls960-ft',
+    'microsoft/wavlm-large',
+    'facebook/data2vec-audio-large',
 ]
-SECONDS = [1, 4, 8]
-BATCH_SIZES = [16, 32, 64]
+SECONDS = [2, 4, 6]
+BATCH_SIZES = [2, 4, 8]
 PRECISIONS = ['fp32', 'fp16']
+
+
+UPLOAD_EVERY_N_MODELS = 20
 
 
 def run_all(upload_fn: Optional[Callable[[pd.DataFrame], None]] = None,
             only_models: Optional[set] = None) -> pd.DataFrame:
-    """Iterate every config; after each model is finished, call upload_fn(current DataFrame)."""
+    """Iterate every config; upload after every N models and once at the end."""
     all_rows: list[dict] = []
-    for model in MODELS:
-        if only_models is not None and model not in only_models:
-            continue
+    selected = [m for m in MODELS if only_models is None or m in only_models]
+    for i, model in enumerate(selected):
         for seconds, batch_size, precision in product(SECONDS, BATCH_SIZES, PRECISIONS):
             params = {"model": model, "seconds": seconds, "batch_size": batch_size, "precision": precision}
             try:
@@ -178,7 +188,9 @@ def run_all(upload_fn: Optional[Callable[[pd.DataFrame], None]] = None,
             finally:
                 torch.cuda.empty_cache()
 
-        if upload_fn:
+        is_milestone = (i + 1) % UPLOAD_EVERY_N_MODELS == 0
+        is_last = i == len(selected) - 1
+        if upload_fn and (is_milestone or is_last):
             try:
                 upload_fn(pd.DataFrame(all_rows))
             except Exception as e:
