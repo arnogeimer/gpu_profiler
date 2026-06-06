@@ -15,11 +15,11 @@ from workloads.robotics import le_world_model
 
 WORKLOADS = [
     ("image_classification", image_classification),
-    ("audio_classification", audio_classification),
-    ("llm_finetune", llm_finetune),
-    ("vlm_inference", vlm_inference),
-    ("le_world_model", le_world_model),
-    ("diffusion_inference", diffusion_inference),
+    #("audio_classification", audio_classification),
+    #("llm_finetune", llm_finetune),
+    #("vlm_inference", vlm_inference),
+    #("le_world_model", le_world_model),
+    #("diffusion_inference", diffusion_inference),
 ]
 
 

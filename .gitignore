@@ -25,3 +25,4 @@ gpus.txt
 
 # Local analysis / plots (not part of the deployed code)
 plotting/
+predictor/
