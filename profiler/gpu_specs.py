@@ -52,12 +52,12 @@ def check_full_power(gpu_name: str, measured_power_limit_w: float | None,
     """Returns (ok, reason). ok=False means this host is running below threshold of stock TDP.
     Unknown GPU models (not in STOCK_TDP_W) pass through as ok=True with a 'spec unknown' note."""
     if measured_power_limit_w is None:
-        return True, "no power limit reported by NVML — cannot verify"
+        return False, "no power limit reported by NVML — cannot verify"
     spec = STOCK_TDP_W.get(gpu_name)
     if spec is None:
-        return True, f"stock TDP unknown for {gpu_name} — proceeding"
+        return False, f"stock TDP unknown for {gpu_name} — proceeding"
     pct = measured_power_limit_w / spec
-    if pct < threshold:
+    if pct < threshold or pct > 1.10:
         return False, (f"measured power_limit_w={measured_power_limit_w:.0f}W is "
                        f"{pct*100:.1f}% of stock TDP {spec:.0f}W (threshold {threshold*100:.0f}%)")
     return True, f"power_limit_w={measured_power_limit_w:.0f}W is {pct*100:.1f}% of stock TDP {spec:.0f}W"
