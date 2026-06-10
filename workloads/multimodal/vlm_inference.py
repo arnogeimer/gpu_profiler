@@ -56,8 +56,13 @@ def run(hyperparams: Hyperparams) -> list[dict]:
         return rows
 
     images = [_make_fake_image() for _ in range(hyperparams.batch_size)]
-    prompts = [PROMPT] * hyperparams.batch_size
+    # Apply the model's chat template so the image placeholder token is inserted correctly.
+    messages = [
+        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": PROMPT}]}
+    ]
     try:
+        text = processor.apply_chat_template(messages, add_generation_prompt=True)
+        prompts = [text] * hyperparams.batch_size
         inputs = processor(text=prompts, images=images, return_tensors="pt", padding=True).to(device)
     except Exception as e:
         rows.append(build_row(hyperparams, "setup", error=f"processor_failed: {e}"))
@@ -118,7 +123,7 @@ MODELS = [
     'llava-hf/llava-interleave-qwen-0.5b-hf',
     # medium (~2B)
     'Qwen/Qwen2-VL-2B-Instruct',
-    'HuggingFaceM4/SmolVLM-Instruct',
+    'HuggingFaceTB/SmolVLM-Instruct',
 ]
 BATCH_SIZES = [1, 2]
 MAX_NEW_TOKENS = [32, 64]
