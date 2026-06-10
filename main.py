@@ -1,8 +1,10 @@
 import io
+import json
 import os
+import uuid
 
 import pandas as pd
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, upload_file
 
 from profiler import gpu_info
 from profiler.gpu_specs import check_full_power
@@ -23,15 +25,19 @@ WORKLOADS = [
     #("diffusion_inference", diffusion_inference),
 ]
 
-# How many independent rentals to collect per (GPU, workload). Salad reassigns
-# physical hosts on restart, so each version is from a different node — taking
-# median across versions later cancels per-host variance.
+# How many independent rentals to collect per (GPU, workload). Each Salad replica is
+# guaranteed to land on a different physical node, so deploying with replicas=N gets
+# us N independent measurements; analysis takes the median across these.
 MAX_VERSIONS = 5
+
+# Unique per-replica identifier so concurrent uploads don't collide on the same path.
+# SALAD_MACHINE_ID is set by Salad's runtime; fall back to a random UUID when running
+# locally outside Salad.
+INSTANCE_ID = os.environ.get("SALAD_MACHINE_ID", f"local-{uuid.uuid4().hex[:8]}")
 
 
 def make_upload_fn(workload_name: str, gpu_name: str, token: str, repo_id: str):
     """Returns a function that uploads a DataFrame to {gpu_name}/{workload_name}.csv."""
-    from huggingface_hub import upload_file
     target = f"{gpu_name}/{workload_name}.csv"
     def upload(df: pd.DataFrame) -> None:
         payload = df.to_csv(index=False).encode("utf-8")
@@ -46,22 +52,24 @@ def make_upload_fn(workload_name: str, gpu_name: str, token: str, repo_id: str):
     return upload
 
 
-def next_version(api: HfApi, repo_id: str, gpu_name: str, workload_name: str) -> int | None:
-    """Returns the lowest version number in [1..MAX_VERSIONS] for which
-    {gpu}/{workload}_full_v{N}.csv does NOT yet exist, or None if all versions are done."""
-    for v in range(1, MAX_VERSIONS + 1):
-        full_path = f"{gpu_name}/{workload_name}_full_v{v}.csv"
-        if not api.file_exists(repo_id, full_path, repo_type="dataset"):
-            return v
-    return None
+def count_existing_versions(api: HfApi, repo_id: str, gpu_name: str, workload_name: str) -> tuple[int, bool]:
+    """Returns (count, already_done_by_this_instance) for {gpu}/{workload}_full_*.csv files.
+
+    Listing happens fresh on each call so concurrently-uploaded versions from sibling
+    replicas are visible. The 'already done' flag prevents a Salad restart from re-running
+    work this same physical instance already completed."""
+    files = api.list_repo_files(repo_id, repo_type="dataset")
+    prefix = f"{gpu_name}/{workload_name}_full_"
+    versions = [f for f in files if f.startswith(prefix) and f.endswith(".csv")]
+    mine = f"{gpu_name}/{workload_name}_full_{INSTANCE_ID}.csv"
+    return len(versions), mine in versions
 
 
 def main() -> None:
     gpu_name = gpu_info.get_gpu_name()
     print(f"GPU: {gpu_name}")
+    print(f"INSTANCE_ID: {INSTANCE_ID}")
 
-    # Refuse to run on a host that has clamped the GPU below its stock TDP — those
-    # measurements would under-represent the silicon and pollute the dataset.
     info = gpu_info.collect()
     ok, reason = check_full_power(gpu_name, info.get("power_limit_w"), threshold=0.95)
     print(f"power check: {reason}")
@@ -72,7 +80,7 @@ def main() -> None:
     token = os.environ.get("HF_TOKEN")
     repo_id = os.environ.get("HF_REPO_ID")
     if not (token and repo_id):
-        print("HF_TOKEN or HF_REPO_ID not set; running without uploads or resume support.")
+        print("HF_TOKEN or HF_REPO_ID not set; running without uploads.")
         for name, module in WORKLOADS:
             print(f"\n=== {name} ===")
             module.run_all(upload_fn=None)
@@ -80,44 +88,38 @@ def main() -> None:
 
     api = HfApi(token=token)
 
-    # For each enabled workload, find the next version slot to fill (v1..v3). Workloads
-    # that already have all MAX_VERSIONS done get skipped — Salad's auto-restart will
-    # naturally land each container on a different physical host, so each version comes
-    # from a different rental.
+    # For each workload: skip if MAX_VERSIONS already collected globally, or if THIS
+    # specific instance already uploaded its own version (e.g. after a Salad restart
+    # to the same node).
     pending = []
     for name, module in WORKLOADS:
-        v = next_version(api, repo_id, gpu_name, name)
-        if v is None:
-            print(f"=== {name} ===  all {MAX_VERSIONS} versions complete for {gpu_name}, skipping.")
+        count, mine_already_uploaded = count_existing_versions(api, repo_id, gpu_name, name)
+        if mine_already_uploaded:
+            print(f"=== {name} ===  this instance already uploaded; skipping.")
+        elif count >= MAX_VERSIONS:
+            print(f"=== {name} ===  already has {count} versions (>= {MAX_VERSIONS}); skipping.")
         else:
-            print(f"=== {name} ===  next version: v{v}")
-            pending.append((name, module, v))
+            print(f"=== {name} ===  {count}/{MAX_VERSIONS} versions exist; this instance will add one.")
+            pending.append((name, module))
 
     if not pending:
-        print(f"\nAll workloads complete (v1..v{MAX_VERSIONS}) for {gpu_name}. Exiting.")
+        print(f"\nNothing to do for {gpu_name}/{INSTANCE_ID}. Exiting.")
         return
 
-    # gpu_info captured on THIS host — tagged with the lowest version we're about to run
-    # so each rental session has its own host snapshot beside its workload CSVs.
-    lowest_v = min(v for _, _, v in pending)
-    gpu_info_versioned_name = f"gpu_info_v{lowest_v}"
-    from huggingface_hub import upload_file
-    import json
+    # gpu_info captured on THIS host — tagged with our instance id alongside the workload CSVs.
     upload_file(
         path_or_fileobj=io.BytesIO(json.dumps(info, indent=2).encode("utf-8")),
         repo_id=repo_id,
-        path_in_repo=f"{gpu_name}/{gpu_info_versioned_name}.json",
+        path_in_repo=f"{gpu_name}/gpu_info_{INSTANCE_ID}.json",
         token=token,
         repo_type="dataset",
     )
-    print(f"  uploaded {gpu_info_versioned_name}.json")
+    print(f"  uploaded gpu_info_{INSTANCE_ID}.json")
 
-    for name, module, v in pending:
-        print(f"\n=== {name} v{v} ===")
-        # No progressive uploads — saves on HF commits. Only the final marker upload runs.
-        df = module.run_all(upload_fn=None)
-        # Final upload — presence of {workload}_full_v{N}.csv = this version complete.
-        make_upload_fn(f"{name}_full_v{v}", gpu_name, token, repo_id)(df)
+    for name, module in pending:
+        print(f"\n=== {name} ({INSTANCE_ID}) ===")
+        df = module.run_all(upload_fn=None)   # no progressive uploads — final only
+        make_upload_fn(f"{name}_full_{INSTANCE_ID}", gpu_name, token, repo_id)(df)
 
 
 if __name__ == "__main__":
