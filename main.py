@@ -1,7 +1,6 @@
 import io
 import json
 import os
-import uuid
 
 import pandas as pd
 from huggingface_hub import HfApi, upload_file
@@ -30,10 +29,11 @@ WORKLOADS = [
 # us N independent measurements; analysis takes the median across these.
 MAX_VERSIONS = 5
 
-# Unique per-replica identifier so concurrent uploads don't collide on the same path.
-# SALAD_MACHINE_ID is set by Salad's runtime; fall back to a random UUID when running
-# locally outside Salad.
-INSTANCE_ID = os.environ.get("SALAD_MACHINE_ID", f"local-{uuid.uuid4().hex[:8]}")
+# Per-replica identifier = the physical GPU's NVML UUID (short prefix). Different Salad
+# replicas land on different physical cards, so this distinguishes concurrent uploaders
+# without races. A re-rental of the same physical card reuses the same ID — the
+# "already-uploaded" check then turns into a free skip instead of duplicate work.
+INSTANCE_ID = gpu_info.get_gpu_uuid()
 
 
 def make_upload_fn(workload_name: str, gpu_name: str, token: str, repo_id: str):
