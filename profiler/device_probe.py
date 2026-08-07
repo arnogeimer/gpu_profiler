@@ -550,6 +550,7 @@ class _ClockSampler:
         self._stop = threading.Event()
         self._thread = None
         self._sm, self._mem, self._temp, self._reasons = [], [], [], 0
+        self._power, self._free = [], []
         self._busy_samples = 0
 
     def start(self) -> None:
@@ -571,6 +572,13 @@ class _ClockSampler:
                 self._sm.append(sm)
                 self._mem.append(pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_MEM))
                 self._temp.append(pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU))
+                # Separates "power-limited" from "clock capped for some other reason", and a
+                # dip in device-wide free VRAM is a co-tenant arriving mid-probe. Both are
+                # reliable here but not in cuda_monitor: these counters need a window of
+                # seconds, and the probe gives minutes where a workload config gives ~0.85s.
+                self._power.append(pynvml.nvmlDeviceGetPowerUsage(h) / 1000.0)
+                mi = pynvml.nvmlDeviceGetMemoryInfo(h)
+                self._free.append((mi.total - mi.used) / 1e9)
                 if reasons_fn is not None:
                     bits = reasons_fn(h)
                     # 0x1 is GpuIdle; only count reasons seen while the card is actually working
@@ -597,6 +605,9 @@ class _ClockSampler:
             "clock_samples": len(self._sm),
             "busy_samples": self._busy_samples,
             "throttle_reasons": sorted(n for n, b in THROTTLE_BITS.items() if self._reasons & b),
+            "power_w_median": statistics.median(self._power) if self._power else None,
+            "power_w_max": max(self._power) if self._power else None,
+            "free_memory_gb_min": round(min(self._free), 2) if self._free else None,
         }
 
 
