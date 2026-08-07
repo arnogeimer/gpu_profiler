@@ -16,12 +16,15 @@ from profiler.cuda_monitor import CUDAMonitor, build_row
 import transformers
 transformers.logging.set_verbosity_error()
 warnings.filterwarnings("ignore")
-from transformers import AutoProcessor, AutoModelForImageTextToText
+from transformers import AutoConfig, AutoProcessor, AutoModelForImageTextToText
+from transformers.initialization import no_init_weights
+from peft import LoraConfig, get_peft_model
 
 
 WARMUP_BATCHES = 1
 TIMED_BATCHES = 3
 PROMPT = "Describe this image in one short sentence."
+LORA_RANK = 16     # adapter rank for the train phase (mirrors llm_finetune)
 
 
 def _make_fake_image(size: int = 384) -> Image.Image:
@@ -47,10 +50,16 @@ def run(hyperparams: Hyperparams) -> list[dict]:
     dtype = torch.float16 if hyperparams.precision == "fp16" else torch.float32
 
     try:
+        # We profile compute, not accuracy: step timings depend only on the architecture
+        # (shapes/dtype), never on weight values. Build from config alone (no checkpoint download)
+        # and skip the CPU random-init too (no_init_weights). Generation length is fixed
+        # (min==max_new_tokens below), so uninitialized weights leave every measured step
+        # unchanged. The processor is tokenizer + image-preprocessor config (no weights) — kept.
         processor = AutoProcessor.from_pretrained(hyperparams.model)
-        model = AutoModelForImageTextToText.from_pretrained(
-            hyperparams.model, torch_dtype=dtype,
-        ).to(device).eval()
+        model_cfg = AutoConfig.from_pretrained(hyperparams.model)
+        with no_init_weights():
+            model = AutoModelForImageTextToText.from_config(model_cfg, dtype=dtype)
+        model = model.to(device).eval()
     except Exception as e:
         rows.append(build_row(hyperparams, "setup", error=f"model_creation_failed: {e}"))
         return rows

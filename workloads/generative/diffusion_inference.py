@@ -16,7 +16,8 @@ import transformers
 diffusers.logging.set_verbosity_error()
 transformers.logging.set_verbosity_error()
 warnings.filterwarnings("ignore")
-from diffusers import AutoPipelineForText2Image
+from transformers import AutoConfig
+from transformers.initialization import no_init_weights
 
 
 WARMUP_BATCHES = 1     # one full denoising loop to JIT-compile kernels
@@ -33,6 +34,40 @@ class Hyperparams:
     precision: str = "fp16"                     # fp32 | fp16
 
 
+def _build_pipeline_random(model_id: str, dtype: torch.dtype, device):
+    """Assemble the text2image pipeline from each component's *config* only — no checkpoint
+    download. We profile compute, not accuracy: timing depends on architecture (shapes/dtype),
+    never on weight values, and the denoising loop runs a fixed num_inference_steps, so random
+    weights leave every measured step unchanged (mirrors the config-only builds elsewhere).
+    Weight-bearing modules (unet, vae, text encoder(s)) get random/uninitialised weights; the
+    weightless bits (tokenizer, scheduler) load normally from their small config/vocab files."""
+    index = diffusers.DiffusionPipeline.load_config(model_id)
+    pipe_cls = getattr(diffusers, index["_class_name"])
+    components = {}
+    for name, spec in index.items():
+        # component entries look like [library, class_name]; skip _class_name / scalars.
+        if not (isinstance(spec, list) and len(spec) == 2):
+            continue
+        lib, cls_name = spec
+        if lib is None:                              # optional component absent (safety_checker, ...)
+            components[name] = None
+        elif lib == "diffusers":
+            cls = getattr(diffusers, cls_name)
+            if "Scheduler" in cls_name:              # scheduler: config only, no weights
+                components[name] = cls.from_pretrained(model_id, subfolder=name)
+            else:                                    # unet / vae: random-init from config
+                components[name] = cls.from_config(cls.load_config(model_id, subfolder=name))
+        elif lib == "transformers":
+            cls = getattr(transformers, cls_name)
+            if "Tokenizer" in cls_name:              # tokenizer: vocab files, no weights
+                components[name] = cls.from_pretrained(model_id, subfolder=name)
+            else:                                    # text encoder: random-init, skip the weights
+                text_cfg = AutoConfig.from_pretrained(model_id, subfolder=name)
+                with no_init_weights():
+                    components[name] = cls(text_cfg)
+    return pipe_cls(**components).to(device=device, dtype=dtype)
+
+
 def run(hyperparams: Hyperparams) -> list[dict]:
     """Run a single config (inference only — diffusion training is impractical on consumer GPUs).
     Returns one or more rows, one per recorded phase."""
@@ -42,12 +77,7 @@ def run(hyperparams: Hyperparams) -> list[dict]:
     dtype = torch.float16 if hyperparams.precision == "fp16" else torch.float32
 
     try:
-        pipe = AutoPipelineForText2Image.from_pretrained(
-            hyperparams.model,
-            torch_dtype=dtype,
-            safety_checker=None,
-            requires_safety_checker=False,
-        ).to(device)
+        pipe = _build_pipeline_random(hyperparams.model, dtype, device)
         pipe.set_progress_bar_config(disable=True)
     except Exception as e:
         rows.append(build_row(hyperparams, "setup", error=f"model_creation_failed: {e}"))

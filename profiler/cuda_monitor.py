@@ -16,33 +16,46 @@ except Exception as e:
     print(f"[cuda_monitor] NVML unavailable: {e}")
 
 
-_MAX_FIELDS = ["memory_used_pct", "memory_used_mb", "memory_used_mb_nvml",
-               "power_w", "gpu_util_pct"]
+_MAX_FIELDS = ["memory_used_pct", "memory_used_mb", "memory_used_mb_nvml"]
 
+# Power and GPU utilisation are deliberately absent. NVML refreshes those counters on the
+# driver's own cadence rather than per query, so polling every 10ms just re-reads a cached
+# value; averaging over the ~0.85s a config takes averages a handful of essentially
+# arbitrarily-aligned driver updates. Measured on one fixed config whose timing was stable to
+# 0.2%, avg_power_w ranged 42-145W and avg_gpu_util_pct 0-68% purely with how long the GPU had
+# been idle beforehand. Memory is kept because mem_get_info is an instantaneous query.
 _SUMMARY_KEYS = [
     "oom", "sample_count", "duration_s", "nvml",
     "max_memory_used_pct", "max_memory_used_mb", "max_memory_used_mb_nvml",
-    "max_power_w", "avg_power_w", "energy_j",
-    "max_gpu_util_pct", "avg_gpu_util_pct",
 ]
 
 
 def build_row(hp, phase: str, metrics: dict | None = None,
-              error: str = "", avg_ms: float | None = None) -> dict:
-    """Build one result row from config + phase + monitor summary / error. No I/O."""
+              error: str = "", avg_ms: float | None = None,
+              timing_method: str = "", kernel_count: int | None = None) -> dict:
+    """Build one result row from config + phase + monitor summary / error. No I/O.
+
+    timing_method records which instrument produced avg_time_ms, because the suite uses two.
+    "cuda_graph" (profiler.time_fn) replays a captured graph and is exact; "kernel_sum"
+    (profiler.kernel_time_fn) sums the profiler's per-kernel device time and reads high by a
+    roughly fixed 2.4-6.9us per kernel, which is 10% of a step built from 80us kernels but 78%
+    of one built from 6us kernels. kernel_count is recorded alongside so that bias can be
+    corrected or fitted rather than silently absorbed."""
     config = asdict(hp) if is_dataclass(hp) else dict(hp)
     return {
         **config,
         "phase": phase,
         "error": error,
         "avg_time_ms": None if avg_ms is None else avg_ms,
+        "timing_method": timing_method,
+        "kernel_count": kernel_count,
         **{k: None if metrics is None else metrics.get(k) for k in _SUMMARY_KEYS},
     }
 
 
 @dataclass
 class CUDAMonitor:
-    """Polls torch.cuda.mem_get_info() + NVML (power, util, full-device memory) in a background thread."""
+    """Polls torch.cuda.mem_get_info() + NVML full-device memory in a background thread."""
     interval_ms: int = 20
     _records: list = field(default_factory=list, init=False, repr=False)
     _timestamps: list = field(default_factory=list, init=False, repr=False)
@@ -64,14 +77,7 @@ class CUDAMonitor:
             "memory_used_mb": used / (1024 ** 2),
         }
         if _NVML_OK:
-            try:
-                rec["power_w"] = pynvml.nvmlDeviceGetPowerUsage(_NVML_HANDLE) / 1000.0
-            except Exception:
-                pass
-            try:
-                rec["gpu_util_pct"] = pynvml.nvmlDeviceGetUtilizationRates(_NVML_HANDLE).gpu
-            except Exception:
-                pass
+            # Whole-device memory, which catches other tenants that torch cannot see.
             try:
                 mem = pynvml.nvmlDeviceGetMemoryInfo(_NVML_HANDLE)
                 rec["memory_used_mb_nvml"] = mem.used / (1024 ** 2)
@@ -102,19 +108,4 @@ class CUDAMonitor:
         for key in _MAX_FIELDS:
             values = [r[key] for r in records if r.get(key) is not None]
             summary[f"max_{key}"] = max(values) if values else None
-
-        powers = [(t, r["power_w"]) for t, r in zip(timestamps, records) if r.get("power_w") is not None]
-        if powers:
-            summary["avg_power_w"] = sum(p for _, p in powers) / len(powers)
-            energy_j = 0.0
-            for i in range(1, len(powers)):
-                dt = powers[i][0] - powers[i-1][0]
-                p_avg = (powers[i-1][1] + powers[i][1]) / 2
-                energy_j += p_avg * dt
-            summary["energy_j"] = energy_j
-
-        utils = [r["gpu_util_pct"] for r in records if r.get("gpu_util_pct") is not None]
-        if utils:
-            summary["avg_gpu_util_pct"] = sum(utils) / len(utils)
-
         return summary
