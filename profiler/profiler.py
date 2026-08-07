@@ -1,12 +1,30 @@
-import torch
+import math
 import statistics
+
+import torch
 
 from torch._C._autograd import DeviceType   # torch.autograd re-exports it but does not declare it
 from torch.profiler import ProfilerActivity, profile
 
 
+# A replay still costs one host-side cudaGraphLaunch, a few microseconds that capture does not
+# remove -- it only removes the per-kernel dispatch inside the graph. When the whole graph is a
+# couple of microseconds of work, that launch is a large fraction of the measurement and the
+# result tracks the node's CPU. Seen across three RTX 5090s: rows above 1ms agreed to 1.6%,
+# rows below 10us disagreed by up to 456%, and the weakest-CPU node was the slow one on 196 of
+# the 358 disagreeing rows. So iters is raised until the captured graph spans MIN_GRAPH_MS,
+# which amortises the launch. Capped because every captured iteration holds its own
+# intermediates in the graph's private memory pool.
+MIN_GRAPH_MS = 2.0
+MAX_ITERS = 200
+
+
 def time_fn(fn, warmup: int, repeats: int, iters: int) -> float:
-    """Median per-iteration CUDA graph ms for function fn."""
+    """Median per-iteration CUDA graph ms for function fn.
+
+    iters is a floor: a cheap fn gets more iterations per capture so one graph launch is
+    amortised over enough work (see MIN_GRAPH_MS). Callers whose step already runs for
+    milliseconds are unaffected."""
     # warmup on a side stream and waits for it to finish
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
@@ -24,6 +42,26 @@ def time_fn(fn, warmup: int, repeats: int, iters: int) -> float:
 
     g.replay()
     torch.cuda.synchronize()
+
+    # Size the graph from a replay rather than from the warmup: warming up runs eagerly and its
+    # first iteration carries cuBLAS/cuDNN handle setup, which overestimated a 2us kernel by 40x
+    # and left iters effectively unraised. One timed replay costs little and is accurate enough.
+    s0 = torch.cuda.Event(enable_timing=True)
+    e0 = torch.cuda.Event(enable_timing=True)
+    s0.record()
+    g.replay()
+    e0.record()
+    torch.cuda.synchronize()
+    per_iter = s0.elapsed_time(e0) / iters
+    if per_iter > 0 and per_iter * iters < MIN_GRAPH_MS:
+        iters = min(MAX_ITERS, math.ceil(MIN_GRAPH_MS / per_iter))
+        del g                       # release the old graph's private pool before recapturing
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for _ in range(iters):
+                fn()
+        g.replay()
+        torch.cuda.synchronize()
 
     # repeats timed windows, median so one perturbed window cannot set the result
     out = []

@@ -79,4 +79,109 @@ and we identify them post-hoc as rows whose `avg_time_ms` exceeds 10× the
 fastest GPU's time for the same (model, img_size, batch_size, precision)
 config.
 
+**A large share of what we were timing was the host CPU, not the GPU.** Kernel
+launches are dispatched from Python: every op walks the torch dispatcher into
+`cudaLaunchKernel`, costing roughly 5–20 µs of *host* time regardless of where
+the tensors live. Putting inputs on the GPU removes the transfer, not the
+dispatch. When kernels are large the GPU hides that cost; when they are small
+the GPU starves waiting for work. Measured against a CUDA-graph capture of the
+same step:
+
+| config | eager wall | GPU kernel time | host share |
+|---|---:|---:|---:|
+| mobilenetv3_small_100 @64 | 27.97 ms | 3.44 ms | 88% |
+| resnet50 @64 | 29.20 ms | 9.14 ms | 69% |
+| resnet50 @224 | 44.68 ms | 44.02 ms | 1% |
+
+This is worse than ordinary noise for a *cross-hardware* dataset: host time does
+not transfer between GPUs, and Salad allocates heterogeneous CPUs, so two nodes
+with the same card could disagree for reasons nothing in the schema explained.
+It also erased the axes we were sweeping — `mobilenetv3_small_100` read ~27 ms
+at both 64 px and 224 px, hiding a real 2.4× difference in GPU work. Mitigation:
+every step is now timed inside a captured CUDA graph (`profiler.time_fn`), so
+the timed window contains no Python at all, and `host_info.json` additionally
+records the node's CPU model, core counts and clock ceiling.
+
+**`model.generate()` measured Python, not the model.** The LLM workload
+originally timed 64 autoregressive decode steps through HuggingFace's generate
+loop. That loop costs ~30 ms of host dispatch *per token*, which swamped the GPU
+entirely: SmolLM2-135M took 1819 ms, SmolLM2-360M 1984 ms, and Qwen2.5-1.5B —
+eleven times the parameters — 1741 ms, i.e. *faster*. Enabling or disabling the
+KV cache changed nothing (4134 ms vs 4062 ms), and raising the batch size 32×
+moved it 3%. PEFT's per-module wrappers alone doubled it. Mitigation: `generate()`
+was dropped in favour of two separate measurements — a prefill forward over the
+whole sequence (compute-bound) and one decode step against a prefilled
+`StaticCache` (weight-bandwidth-bound), both graph-captured. Both now scale with
+model size as they should.
+
+**One workload cannot be graph-captured, so the dataset carries two timing
+instruments.** Object detection fails capture in three independent places:
+torchvision's `GeneralizedRCNNTransform` builds host tensors inside the forward,
+the DETR-family loss constructs a criterion module and moves it to the device per
+call, and YOLOS trips an RNG-offset error. Detection therefore reports GPU kernel
+time by summing the profiler's per-kernel device time (`profiler.kernel_time_fn`)
+rather than by replaying a capture. The two agree on the quantity but not
+exactly: kernel-sum reads high by a roughly fixed **2.4–6.9 µs per kernel**,
+which is ~10% of a step built from 80 µs kernels but ~78% of one built from 6 µs
+kernels. Every row records `timing_method` (`cuda_graph` | `kernel_sum`) and
+`kernel_count`, so the bias can be corrected or fitted rather than silently
+absorbed. This still beats the alternative — eager wall-clock for detection was
+5% host at 800 px/bs 8 but 62% at 320 px/bs 2.
+
+**NVML power and utilisation are meaningless over a sub-second window.** Both
+counters refresh on the driver's own cadence rather than per query, so polling
+every 10 ms re-reads a cached value and averaging over the ~0.85 s a config takes
+averages a handful of arbitrarily-aligned driver updates. On one fixed config
+whose timing was reproducible to 0.2%, `avg_power_w` ranged 42–145 W and
+`avg_gpu_util_pct` 0–68% purely with how long the card had been idle beforehand —
+and utilisation moved *upward* with more preceding idle. Mitigation:
+`max_power_w`, `avg_power_w`, `energy_j`, `max_gpu_util_pct` and
+`avg_gpu_util_pct` were removed from the schema rather than shipped looking
+meaningful. Memory is kept, because `mem_get_info` is an instantaneous query.
+Trustworthy power would need a dedicated multi-second replay window (stable to
+1.4% when measured that way), which would roughly double the sweep. Note that
+CSVs collected before this change still contain those columns.
+
+**Untrained detectors diverge, and detection losses raise rather than return
+garbage.** We build models from `config.json` without checkpoints, since step
+timing depends on architecture and not weight values. That is safe for
+classification and language models — a NaN loss still dispatches identical
+kernels — but set-prediction detectors validate their own box geometry before
+the Hungarian match, so once weights blow up the step raises `ValueError` and the
+config is lost. At `lr=0.01` an untrained detector diverges by step 2;
+`conditional-detr-resnet-50` failed exactly this way, and it is also why RT-DETR
+and Deformable-DETR were initially misdiagnosed as unusable. Mitigation:
+detection trains at `lr=0.0`. SGD issues an identical kernel sequence at zero
+learning rate (`param.add_(d_p, alpha=-0)` is not short-circuited), so the
+measurement is unchanged while the weights stay finite. Detection's error handler
+also catches `Exception` rather than `RuntimeError`, since these losses raise
+`ValueError`.
+
+**Models silently ignore the axis you are sweeping.** Several configurations
+accept a shape parameter and then discard it, producing rows that differ only in
+their label:
+
+- `ssd300_vgg16` and `ssdlite320_mobilenet_v3_large` hardcode 300/320 in their
+  transforms, ignoring `min_size`/`max_size` — all three `img_size` values gave
+  the same measurement. Both were dropped from the model list.
+- torchvision's other detectors rescale every input to an 800/1333 default
+  unless `min_size`/`max_size` are pinned per config.
+- Whisper pads every clip to 30 s unless `max_source_positions` is resized, so
+  the `seconds` axis measured nothing for those models.
+- `efficientformer_l1`/`l3` hardcode a 49-token attention bias and only run at
+  224 px, failing 24 configs per GPU. Both were dropped.
+- The image-classification inference phase used a hardcoded batch of 128 while
+  the row was stamped with the config's batch size, so three identical runs were
+  labelled 16/32/64.
+
+The general lesson: after setting a shape parameter, read back what the model
+actually ran at rather than trusting that it took effect.
+
+**Roughly half the audio step was numpy running on the CPU.** wav2vec2-family
+configs enable SpecAugment by default, and `_compute_mask_indices` builds its
+masks in numpy on the host. Cost ranged from 1.7% of the step (`wavlm-base`) to
+45.4% (`hubert-base-ls960`) — large, per-model-variable, and stochastic, since
+masks are redrawn every step. Mitigation: `apply_spec_augment = False` is set on
+every config before the model is built.
+
 
