@@ -5,6 +5,7 @@ CUDA kernel timing probes for different operations.
 '''
 
 import json
+import os
 import platform
 import random
 import statistics
@@ -497,6 +498,16 @@ def device_meta() -> dict:
              lambda: pynvml.nvmlDeviceGetMaxClockInfo(h, pynvml.NVML_CLOCK_GRAPHICS)),
             ("max_memory_clock_mhz",
              lambda: pynvml.nvmlDeviceGetMaxClockInfo(h, pynvml.NVML_CLOCK_MEM)),
+            # A board can enforce below its configured limit -- insufficient power connectors,
+            # for instance -- which would explain a card hitting its ceiling at a low clock
+            # while power_limit_w still reads stock.
+            ("enforced_power_limit_w", lambda: pynvml.nvmlDeviceGetEnforcedPowerLimit(h) / 1000.0),
+            ("power_limit_range_w",
+             lambda: [x / 1000.0 for x in pynvml.nvmlDeviceGetPowerManagementLimitConstraints(h)]),
+            # Reference point for max_temp_c: without it, a die temperature means nothing.
+            ("thermal_slowdown_c", lambda: pynvml.nvmlDeviceGetTemperatureThreshold(
+                h, pynvml.NVML_TEMPERATURE_THRESHOLD_SLOWDOWN)),
+            ("max_pcie_link_width", lambda: pynvml.nvmlDeviceGetMaxPcieLinkWidth(h)),
         ):
             try:
                 v = fn()
@@ -534,6 +545,26 @@ THROTTLE_BITS = {
 }
 CLOCK_SAMPLE_MS = 100
 
+# Cumulative nanoseconds the card was held down by each cause. Strictly better than the
+# throttle bitmask, which collapsed to ['sw_power_cap'] on all 11 nodes of one fleet and
+# separated nothing: these are time-weighted and attribute the loss to a specific policy.
+# Read at probe start and end; only the delta over the run is meaningful.
+VIOLATION_POLICIES = ("POWER", "THERMAL", "SYNC_BOOST", "BOARD_LIMIT", "RELIABILITY")
+
+
+def _violations(pynvml, h) -> dict:
+    """Cumulative throttle nanoseconds per policy, or {} where unsupported."""
+    out = {}
+    for name in VIOLATION_POLICIES:
+        pol = getattr(pynvml, f"NVML_PERF_POLICY_{name}", None)
+        if pol is None:
+            continue
+        try:
+            out[name] = pynvml.nvmlDeviceGetViolationStatus(h, pol).violationTime
+        except Exception:
+            pass
+    return out
+
 
 class _ClockSampler:
     """Polls the clock actually sustained under load, plus why it is being held down.
@@ -551,6 +582,8 @@ class _ClockSampler:
         self._thread = None
         self._sm, self._mem, self._temp, self._reasons = [], [], [], 0
         self._power, self._free = [], []
+        self._pstate, self._fan, self._pcie_w, self._pcie_g, self._others = [], [], [], [], []
+        self._viol_start = {}
         self._busy_samples = 0
 
     def start(self) -> None:
@@ -566,6 +599,8 @@ class _ClockSampler:
             return
         reasons_fn = getattr(pynvml, "nvmlDeviceGetCurrentClocksEventReasons",
                              getattr(pynvml, "nvmlDeviceGetCurrentClocksThrottleReasons", None))
+        self._viol_start = _violations(pynvml, h)
+        me = os.getpid()
         while True:
             try:
                 sm = pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_SM)
@@ -579,6 +614,14 @@ class _ClockSampler:
                 self._power.append(pynvml.nvmlDeviceGetPowerUsage(h) / 1000.0)
                 mi = pynvml.nvmlDeviceGetMemoryInfo(h)
                 self._free.append((mi.total - mi.used) / 1e9)
+                self._pstate.append(pynvml.nvmlDeviceGetPerformanceState(h))
+                self._fan.append(pynvml.nvmlDeviceGetFanSpeed(h))
+                self._pcie_w.append(pynvml.nvmlDeviceGetCurrPcieLinkWidth(h))
+                self._pcie_g.append(pynvml.nvmlDeviceGetCurrPcieLinkGeneration(h))
+                # Definitive co-tenancy answer; free VRAM is not, since our own probe
+                # allocations dominate the dip.
+                self._others.append(sum(1 for x in pynvml.nvmlDeviceGetComputeRunningProcesses(h)
+                                        if x.pid != me))
                 if reasons_fn is not None:
                     bits = reasons_fn(h)
                     # 0x1 is GpuIdle; only count reasons seen while the card is actually working
@@ -594,8 +637,16 @@ class _ClockSampler:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=2)
+        viol = {}
+        try:
+            import pynvml
+            end = _violations(pynvml, pynvml.nvmlDeviceGetHandleByIndex(0))
+            viol = {f"violation_{k.lower()}_ms": round((end[k] - self._viol_start.get(k, 0)) / 1e6, 1)
+                    for k in end if k in self._viol_start}
+        except Exception:
+            pass
         if not self._sm:
-            return {}
+            return viol
         busy = [c for c in self._sm if c > 0]
         return {
             "achieved_sm_clock_mhz_median": statistics.median(busy),
@@ -608,6 +659,12 @@ class _ClockSampler:
             "power_w_median": statistics.median(self._power) if self._power else None,
             "power_w_max": max(self._power) if self._power else None,
             "free_memory_gb_min": round(min(self._free), 2) if self._free else None,
+            "perf_state_max": max(self._pstate) if self._pstate else None,
+            "fan_speed_pct_max": max(self._fan) if self._fan else None,
+            "pcie_link_width_max": max(self._pcie_w) if self._pcie_w else None,
+            "pcie_link_gen_max": max(self._pcie_g) if self._pcie_g else None,
+            "other_processes_max": max(self._others) if self._others else None,
+            **viol,
         }
 
 

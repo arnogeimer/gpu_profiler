@@ -116,7 +116,7 @@ WORKLOADS = [
 ]
 
 # How many independent rentals to collect per (GPU, workload).
-MAX_VERSIONS = 10
+MAX_VERSIONS = 5
 INSTANCE_ID = host_info.get_gpu_uuid()
 
 # Every artefact is written at the END of a run that has already spent hours computing, so a
