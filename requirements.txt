@@ -1,15 +1,25 @@
-# Pinned to the exact CUDA build so cuDNN/cuBLAS/cutlass (bundled in the wheel) — and thus the
-# kernel vocabulary — are identical on every GPU. The +cu130 wheels live on PyTorch's index.
+# Everything that determines what kernels get dispatched is pinned exactly, because rows are
+# collected across many nodes over weeks and must stay comparable. torch/torchvision fix the
+# CUDA build (cuDNN/cuBLAS/cutlass ship inside the wheel), and the four model libraries below
+# fix the model definitions themselves -- a timm or transformers release mid-collection would
+# silently change layer composition, so an October resnet50 would not be comparable to today's.
+# The +cu130 wheels live on PyTorch's index.
 --extra-index-url https://download.pytorch.org/whl/cu130
 torch==2.11.0+cu130
-timm>=1.0.27
 torchvision==0.26.0+cu130
+
+# Model definitions. transformers must be 5.x: the workloads import
+# transformers.initialization.no_init_weights, which does not exist in 4.x.
+timm==1.0.27
+transformers==5.10.1
+peft==0.20.0
+diffusers==0.37.1
+
+# Support libraries. Left as floors: none of them affect which kernels run, only how results
+# are gathered and written.
+accelerate>=0.30
 huggingface-hub>=1.0
 nvidia-ml-py>=12.0
-transformers>=4.46
 pandas>=2.0
-diffusers>=0.30
-accelerate>=0.30
 pillow>=10.0
 numpy>=1.24
-peft>=0.10
