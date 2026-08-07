@@ -7,7 +7,9 @@ CUDA kernel timing probes for different operations.
 import json
 import platform
 import random
+import statistics
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -518,22 +520,107 @@ def save(sig: dict, path: str | Path | None = None) -> Path:
     return out
 
 
+# NVML throttle-reason bits worth recording. GpuIdle (0x1) is excluded on purpose: it fires
+# whenever the card is between measurements and says nothing about capability.
+THROTTLE_BITS = {
+    "applications_clocks": 0x2,
+    "sw_power_cap": 0x4,
+    "hw_slowdown": 0x8,
+    "sync_boost": 0x10,
+    "sw_thermal": 0x20,
+    "hw_thermal": 0x40,
+    "hw_power_brake": 0x80,
+    "display_clock": 0x100,
+}
+CLOCK_SAMPLE_MS = 100
+
+
+class _ClockSampler:
+    """Polls the clock actually sustained under load, plus why it is being held down.
+
+    device_meta records max_sm_clock_mhz, the card's advertised ceiling, which reads identical
+    on a healthy and a throttled card. One RTX 5090 node measured ~38% slower than three
+    siblings across every probe arm while reporting the same 3090 MHz ceiling, a stock 575 W
+    power limit, and the highest startup TFLOPS of the group -- nothing in the metadata
+    separated it. What does is the clock it actually holds while working, and NVML's reason for
+    the difference. Sampling runs through the whole probe, which is minutes of sustained load."""
+
+    def __init__(self, interval_ms: int = CLOCK_SAMPLE_MS):
+        self.interval_s = interval_ms / 1000.0
+        self._stop = threading.Event()
+        self._thread = None
+        self._sm, self._mem, self._temp, self._reasons = [], [], [], 0
+        self._busy_samples = 0
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def _poll(self) -> None:
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        except Exception:
+            return
+        reasons_fn = getattr(pynvml, "nvmlDeviceGetCurrentClocksEventReasons",
+                             getattr(pynvml, "nvmlDeviceGetCurrentClocksThrottleReasons", None))
+        while True:
+            try:
+                sm = pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_SM)
+                self._sm.append(sm)
+                self._mem.append(pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_MEM))
+                self._temp.append(pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU))
+                if reasons_fn is not None:
+                    bits = reasons_fn(h)
+                    # 0x1 is GpuIdle; only count reasons seen while the card is actually working
+                    if not bits & 0x1:
+                        self._busy_samples += 1
+                        self._reasons |= bits
+            except Exception:
+                pass
+            if self._stop.wait(self.interval_s):
+                break
+
+    def stop(self) -> dict:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        if not self._sm:
+            return {}
+        busy = [c for c in self._sm if c > 0]
+        return {
+            "achieved_sm_clock_mhz_median": statistics.median(busy),
+            "achieved_sm_clock_mhz_max": max(busy),
+            "achieved_mem_clock_mhz_median": statistics.median(self._mem),
+            "max_temp_c": max(self._temp) if self._temp else None,
+            "clock_samples": len(self._sm),
+            "busy_samples": self._busy_samples,
+            "throttle_reasons": sorted(n for n, b in THROTTLE_BITS.items() if self._reasons & b),
+        }
+
+
 def run_probe(dtypes: dict | None = None) -> dict:
     """Measure the full signature and return it as a dict."""
     if not torch.cuda.is_available():
         raise RuntimeError("no CUDA device")
 
+    sampler = _ClockSampler()
+    sampler.start()
     rows: list = []
-    for name, dt in (dtypes or DTYPES).items():
-        probe_gemm(rows, dt, name)
-        probe_bmm(rows, dt, name)
-        probe_conv(rows, dt, name)
-        probe_attn(rows, dt, name)
-        probe_elementwise(rows, dt, name)
-        probe_pool(rows, dt, name)
-        probe_rnn(rows, dt, name)
+    try:
+        for name, dt in (dtypes or DTYPES).items():
+            probe_gemm(rows, dt, name)
+            probe_bmm(rows, dt, name)
+            probe_conv(rows, dt, name)
+            probe_attn(rows, dt, name)
+            probe_elementwise(rows, dt, name)
+            probe_pool(rows, dt, name)
+            probe_rnn(rows, dt, name)
+    finally:
+        clocks = sampler.stop()
 
-    return {"device": {**device_meta()}, "probes": rows}
+    return {"device": {**device_meta(), **clocks}, "probes": rows}
 
 
 def main() -> None:
