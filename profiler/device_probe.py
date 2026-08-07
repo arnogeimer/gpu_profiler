@@ -35,7 +35,7 @@ DTYPES = {"fp16": torch.float16, "fp32": torch.float32, "bf16": torch.bfloat16}
 GEMM_HIDDEN = [(768, 768), (3072, 768), (768, 3072), (1536, 576), (49152, 576)]
 GEMM_M = [80, 256, 512, 2048, 3152, 8192]
 GEMM_SQUARE = [1024, 2048, 4096]
-GEMM_TIMING = (3, 5, 20)
+GEMM_TIMING = (3, 10, 20)
 
 # (batch, M, N, K). Not recoverable from the gemm arm: at equal total FLOPs the time
 # swings ~3x with how the work splits between batch and matrix dims. The first three rows
@@ -50,10 +50,10 @@ BMM_SHAPES = [(256, 128, 128, 128),
               (192, 197, 64, 197),
               (36, 512, 512, 64),
               (36, 512, 64, 512)]
-BMM_TIMING = (3, 5, 20)
+BMM_TIMING = (3, 10, 20)
 
 ELEMENTWISE_NUMEL = [2 ** 19, 2 ** 21, 2 ** 23, 2 ** 25, 2 ** 26, 2 ** 27, 2 ** 28]
-ELEMENTWISE_TIERS = [(2 ** 23, 3, 5, 200), (2 ** 26, 3, 5, 20), (2 ** 63, 3, 5, 3)]
+ELEMENTWISE_TIERS = [(2 ** 23, 3, 10, 200), (2 ** 26, 3, 10, 20), (2 ** 63, 3, 10, 3)]
 
 # (bs, cin, cout, hw, k, stride, pad, groups); pad is explicit because patch embedding
 # needs pad=0 at k=16, which k//2 cannot express.
@@ -67,7 +67,7 @@ CONV_SHAPES = [(16, 3, 64, 224, 7, 2, 3, 1),
                (16, 512, 512, 7, 3, 1, 1, 1),
                (16, 512, 2048, 7, 1, 1, 0, 1)]
 CONV_DIRECTIONS = ("fprop", "dgrad", "wgrad")
-CONV_TIMING = (3, 5, 20)
+CONV_TIMING = (3, 10, 20)
 
 # (bs, q_heads, kv_heads, seq_q, seq_kv, head_dim). q_heads != kv_heads is GQA and
 # seq_q != seq_kv is cross-attention; both are dispatched by the workloads and neither
@@ -81,13 +81,13 @@ ATTN_SHAPES = [(16, 12, 12, 197, 197, 64),
                (2, 32, 8, 2048, 2048, 128),
                (2, 8, 8, 4096, 4096, 40),
                (2, 8, 8, 4096, 77, 40)]
-ATTN_TIMING = (3, 5, 10)
+ATTN_TIMING = (3, 10, 10)
 
 # (bs, c, hw, k, stride) x max/avg/adaptive_avg. 64c56 and 256c28 are gone: their times
 # did not move with dtype, so they were reporting a launch floor rather than the op.
 POOL_SHAPES = [(16, 64, 112, 3, 2), (16, 2048, 7, 3, 1)]
 POOL_KINDS = ("max", "avg", "adaptive_avg")
-POOL_TIMING = (3, 5, 50)
+POOL_TIMING = (3, 10, 50)
 
 # (bs, seq, input, hidden, layers, bidirectional) x lstm/gru/rnn. One axis moves per row
 # off a fixed baseline. No workload uses a recurrent layer, so unlike the other arms these
@@ -101,7 +101,7 @@ RNN_SHAPES = [(32, 128, 512, 512, 1, False),
               (8, 128, 512, 512, 1, False),
               (128, 128, 512, 512, 1, False)]
 RNN_KINDS = ("lstm", "gru", "rnn")
-RNN_TIMING = (3, 5, 10)
+RNN_TIMING = (3, 10, 10)
 
 DIRECTIONS = ("fwd", "fwd_bwd")
 # a captured fwd_bwd iteration allocates fresh activations and grads that the plain forward

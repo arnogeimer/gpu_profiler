@@ -27,8 +27,8 @@ WARMUP_BATCHES = 3
 TIMED_BATCHES = 6
 
 # (warmup, repeats, iters) for device_probe.time_fn, used by the llm phases below.
-PREFILL_TIMING = (3, 5, 3)
-DECODE_TIMING = (2, 5, 4)
+PREFILL_TIMING = (3, 10, 3)
+DECODE_TIMING = (2, 10, 4)
 
 
 def _decode_cache_len(sequence_length: int) -> int:

@@ -30,6 +30,25 @@ _SUMMARY_KEYS = [
 ]
 
 
+def progress_line(model: str, i: int, total: int, label: str, prev_start: float | None) -> float:
+    """Print one progress line per model and return its start time, to pass in on the next call.
+
+    One line per model rather than per config: a full sweep is ~4000 configs, and that much
+    output was suspected of truncating a node's logs. The timestamp and previous duration are
+    here because the reduction cuts both ways -- with 20+ minutes between lines on a large
+    model, silence alone cannot distinguish a slow node from a hung one, so the last line
+    printed has to carry enough to tell them apart."""
+    now = time.time()
+    took = ""
+    if prev_start is not None:
+        secs = now - prev_start
+        took = (f"  | previous {int(secs // 60)}m{int(secs % 60):02d}s" if secs >= 60
+                else f"  | previous {secs:.1f}s")
+    print(f"[{time.strftime('%H:%M:%S')}] Started training model {model}"
+          f"  ({i}/{total} {label}){took}", flush=True)
+    return now
+
+
 def build_row(hp, phase: str, metrics: dict | None = None,
               error: str = "", avg_ms: float | None = None,
               timing_method: str = "", kernel_count: int | None = None) -> dict:

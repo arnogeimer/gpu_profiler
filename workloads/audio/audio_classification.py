@@ -16,7 +16,7 @@ import pandas as pd
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from profiler.cuda_monitor import CUDAMonitor, build_row
+from profiler.cuda_monitor import CUDAMonitor, build_row, progress_line
 from profiler.profiler import time_fn
 
 import transformers
@@ -28,7 +28,7 @@ from transformers.initialization import no_init_weights
 
 # (warmup, repeats, iters) handed to time_fn. The step is measured inside a captured CUDA
 # graph, so no Python dispatch lands in the timed window.
-TRAIN_TIMING = (3, 5, 2)
+TRAIN_TIMING = (3, 10, 2)
 TIMING_METHOD = "cuda_graph"
 
 SAMPLE_RATE = 16000       # waveform models expect 16 kHz samples
@@ -119,10 +119,6 @@ def run(hyperparams: Hyperparams) -> list[dict]:
     torch.cuda.empty_cache()
 
     del model, optimizer, x, y
-    short = hyperparams.model.split("/")[-1]
-    def _fmt(avg_ms, batch):
-        return "OOM" if avg_ms is None else f"{avg_ms / batch:.3f} ms/sample"
-    print(f"train: {_fmt(train_avg_ms, hyperparams.batch_size)}  ({short} | {hyperparams.seconds}s | bs={hyperparams.batch_size} | {hyperparams.precision})")
     return rows
 
 
@@ -169,7 +165,9 @@ def run_all(only_models: Optional[set] = None) -> pd.DataFrame:
     """Iterate every config. Returns one row per recorded phase; main.py uploads the result."""
     all_rows: list[dict] = []
     selected = [m for m in MODELS if only_models is None or m in only_models]
-    for model in selected:
+    prev = None
+    for i, model in enumerate(selected, 1):
+        prev = progress_line(model, i, len(selected), "audio classification", prev)
         for seconds, batch_size, precision in product(SECONDS, BATCH_SIZES, PRECISIONS):
             params = {"model": model, "seconds": seconds, "batch_size": batch_size, "precision": precision}
             try:

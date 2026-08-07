@@ -17,7 +17,7 @@ import torch.nn as nn
 import timm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from profiler.cuda_monitor import CUDAMonitor, build_row
+from profiler.cuda_monitor import CUDAMonitor, build_row, progress_line
 from profiler.profiler import time_fn
 
 
@@ -25,7 +25,7 @@ from profiler.profiler import time_fn
 # so no Python dispatch lands in the timed window. That matters here more than anywhere else in
 # the suite: timed eagerly, a small model at a small img_size spends up to 88% of its wall time
 # waiting on the host, which buries the img_size signal entirely and varies with the node's CPU.
-TRAIN_TIMING = (3, 5, 2)
+TRAIN_TIMING = (3, 10, 2)
 TIMING_METHOD = "cuda_graph"
 
 # fp32 runs without autocast; the other two run under it. No GradScaler on any of them: its
@@ -97,9 +97,6 @@ def run(hyperparams: Hyperparams) -> list[dict]:
     torch.cuda.empty_cache()
 
     del model, optimizer, x, y
-    def _fmt(avg_ms, batch):
-        return "OOM" if avg_ms is None else f"{avg_ms / batch:.3f} ms/sample"
-    print(f"train: {_fmt(train_avg_ms, hyperparams.batch_size)}  ({hyperparams.model} | {img_size}x{img_size} | bs={hyperparams.batch_size} | {hyperparams.precision})")
     return rows
 
 
@@ -138,7 +135,9 @@ def run_all(only_models: Optional[set] = None) -> pd.DataFrame:
     """Iterate every config. Returns one row per recorded phase; main.py uploads the result."""
     all_rows: list[dict] = []
     selected = [m for m in MODELS if only_models is None or m in only_models]
-    for model in selected:
+    prev = None
+    for i, model in enumerate(selected, 1):
+        prev = progress_line(model, i, len(selected), "image classification", prev)
         for img_size, batch_size, precision in product(IMG_SIZES, BATCH_SIZES, PRECISIONS):
             params = {"model": model, "img_size": img_size, "batch_size": batch_size, "precision": precision}
             try:

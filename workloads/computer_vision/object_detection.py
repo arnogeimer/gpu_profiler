@@ -18,7 +18,7 @@ import torch
 from torchvision.models import detection as tvdet
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from profiler.cuda_monitor import CUDAMonitor, build_row
+from profiler.cuda_monitor import CUDAMonitor, build_row, progress_line
 from profiler.profiler import kernel_time_fn
 
 import transformers
@@ -32,7 +32,7 @@ from transformers import AutoConfig, AutoModelForObjectDetection
 # loss both build host tensors inside the forward -- so GPU kernel time is read off the profiler
 # instead. Eager wall-clock was 5% host at 800px/bs8 but 62% at 320px/bs2, so roughly a third of
 # this grid would otherwise have been measuring the node's CPU.
-TRAIN_TIMING = (3, 5, 2)
+TRAIN_TIMING = (3, 10, 2)
 TIMING_METHOD = "kernel_sum"   # the only workload not measured by CUDA graph capture
 
 NUM_CLASSES = 16
@@ -154,10 +154,6 @@ def run(hyperparams: Hyperparams) -> list[dict]:
     torch.cuda.empty_cache()
 
     del model, optimizer, inputs, targets
-    short = hyperparams.model.split("/")[-1]
-    def _fmt(avg_ms, batch):
-        return "OOM" if avg_ms is None else f"{avg_ms / batch:.3f} ms/sample"
-    print(f"train: {_fmt(train_avg_ms, hyperparams.batch_size)}  ({short} | {img_size}x{img_size} | bs={hyperparams.batch_size} | {hyperparams.precision})")
     return rows
 
 
@@ -189,7 +185,9 @@ def run_all(only_models: Optional[set] = None) -> pd.DataFrame:
     """Iterate every config. Returns one row per recorded phase; main.py uploads the result."""
     all_rows: list[dict] = []
     selected = [m for m in MODELS if only_models is None or m in only_models]
-    for model in selected:
+    prev = None
+    for i, model in enumerate(selected, 1):
+        prev = progress_line(model, i, len(selected), "object detection", prev)
         for img_size, batch_size, precision in product(IMG_SIZES, BATCH_SIZES, PRECISIONS):
             params = {"model": model, "img_size": img_size, "batch_size": batch_size, "precision": precision}
             try:

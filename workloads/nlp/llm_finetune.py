@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from profiler.cuda_monitor import CUDAMonitor, build_row
+from profiler.cuda_monitor import CUDAMonitor, build_row, progress_line
 from profiler.profiler import time_fn
 
 import transformers
@@ -22,7 +22,7 @@ from peft import LoraConfig, get_peft_model
 
 # (warmup, repeats, iters) handed to time_fn. The step is measured inside a captured CUDA graph,
 # so no Python dispatch lands in the timed window.
-TRAIN_TIMING = (3, 5, 2)
+TRAIN_TIMING = (3, 10, 2)
 TIMING_METHOD = "cuda_graph"
 
 # fp32 runs without autocast; the other two run under it.
@@ -114,11 +114,6 @@ def run(hyperparams: Hyperparams) -> list[dict]:
     torch.cuda.empty_cache()
 
     del model, base, optimizer, train_ids
-    short = hyperparams.model.split("/")[-1]
-    def _fmt(avg_ms, batch):
-        return "OOM" if avg_ms is None else f"{avg_ms / batch:.2f} ms/sample"
-    print(f"train: {_fmt(train_avg_ms, hyperparams.batch_size)}"
-          f"  ({short} | seq={hyperparams.sequence_length} | bs={hyperparams.batch_size} | r={hyperparams.lora_rank} | {hyperparams.precision})")
     return rows
 
 
@@ -170,7 +165,9 @@ def run_all(only_models: Optional[set] = None) -> pd.DataFrame:
     """Iterate every config. Returns one row per recorded phase; main.py uploads the result."""
     all_rows: list[dict] = []
     selected = [m for m in MODELS if only_models is None or m in only_models]
-    for model in selected:
+    prev = None
+    for i, model in enumerate(selected, 1):
+        prev = progress_line(model, i, len(selected), "llm finetune", prev)
         for seq, bs, rank, precision in product(SEQUENCE_LENGTHS, BATCH_SIZES, LORA_RANKS, PRECISIONS):
             params = {
                 "model": model,
