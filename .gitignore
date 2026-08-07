@@ -26,3 +26,9 @@ gpus.txt
 # Local analysis / plots (not part of the deployed code)
 plotting/
 predictor/
+
+# Local profiling tools. Run by hand against the workloads; main.py never imports them, so
+# they only bloat the image the Dockerfile clones.
+profiler/kernel_census.py
+profiler/kernel_normalize.py
+profiler/model_profiler.py
