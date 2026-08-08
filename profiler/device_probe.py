@@ -724,3 +724,50 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def compare_to_reference(sig: dict, references: list[dict]) -> tuple[float | None, int]:
+    """(median row-time ratio of `sig` against `references`, number of rows compared).
+
+    1.0 means this card matches the reference; 1.44 means it is 44% slower. The reference is
+    the per-row FASTEST across every prior probe of the same GPU model -- the same one-sided
+    noise argument time_fn uses, since a card can be degraded but not better than the silicon.
+    Rows are matched on the full identity of the measurement, and only rows present everywhere
+    are used.
+
+    Note what this makes the reference sensitive to: on eleven RTX 5090s the fastest node ran a
+    600W host while stock is 575W, and the stock cards landed at 1.053-1.082 against it. A tight
+    tolerance therefore screens on host power limit as much as on card health -- see
+    PERF_TOLERANCE in main.py.
+
+    This is what screens a card before committing hours of workload time to it. It works
+    because the probe ranks cards almost perfectly: across eleven RTX 5090s the probe ratio and
+    the sustained clock fraction correlated at 0.997, healthy cards landed within 5% of each
+    other, and the two bad ones stood out at 1.16 and 1.44. It also catches what the startup
+    TFLOPS number does not -- that ran before the card settled and reported the worst card as
+    the fastest of the group."""
+    def rows(s):
+        out = {}
+        for r in s.get("probes", []):
+            key = (r.get("probe"), r.get("dtype"), r.get("size"),
+                   r.get("direction"), r.get("kind"), r.get("causal"))
+            if r.get("ms"):
+                out[key] = r["ms"]
+        return out
+
+    mine = rows(sig)
+    refs = [rows(r) for r in references]
+    refs = [r for r in refs if r]
+    if not mine or not refs:
+        return None, 0
+    common = set(mine).intersection(*[set(r) for r in refs])
+    if not common:
+        return None, 0
+    ratios = []
+    for k in common:
+        ref = min(r[k] for r in refs)
+        if ref > 0:
+            ratios.append(mine[k] / ref)
+    if not ratios:
+        return None, 0
+    return statistics.median(ratios), len(ratios)

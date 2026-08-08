@@ -86,12 +86,16 @@ device_probe/{uuid}.json -- {"device": {...}, "probes": [...]}
 import io
 import json
 import os
+import pathlib
+import signal
+import sys
 import time
 
 import pandas as pd
 import torch
 from huggingface_hub import HfApi, hf_hub_download, upload_file
 
+import salad
 from profiler import device_probe, host_info
 from profiler.host_info import check_full_power
 from workloads.computer_vision import image_classification, object_detection
@@ -109,21 +113,43 @@ WORKLOADS = [
     ("image_classification", image_classification),
     ("audio_classification", audio_classification),
     ("llm_finetune", llm_finetune),
-    # object_detection is parked, not broken. It is the only workload a CUDA graph cannot
-    # capture, so it reports GPU kernel time via the profiler instead -- and detection kernels
-    # are small enough (4.8-22.7us) that the profiler's per-kernel overhead is 20-94% of the
-    # reported time, varying with both config and card speed. That is a confound in exactly the
-    # dimension being predicted. Re-enable once the overhead is calibrated on detection-shaped
-    # kernels; the backbone alone does capture, so both instruments can be compared directly.
-    #("object_detection", object_detection),
+    # Detection is the one workload a CUDA graph cannot capture, so it reports GPU kernel time
+    # via the profiler instead. Its kernels are small (4.8-22.7us), so the profiler's per-kernel
+    # overhead is 20-94% of the reported time depending on config -- timing_method and
+    # kernel_count are recorded per row so that bias can be corrected rather than absorbed.
+    ("object_detection", object_detection),
     #("vlm_inference", vlm_inference),
     #("le_world_model", le_world_model),
     #("diffusion_inference", diffusion_inference),
 ]
 
-# How many independent rentals to collect per (GPU, workload).
-MAX_VERSIONS = 5
 INSTANCE_ID = host_info.get_gpu_uuid()
+
+# PROBE_ONLY is read from the environment so it can be flipped in the SaladCloud console
+# without a rebuild. Two passes:
+#   PROBE_ONLY=1  many instances per GPU model, probe and exit. Builds the reference.
+#   unset         one instance, probe, screen against that reference, then run workloads.
+# A card that fails the screen exits so the platform reallocates -- cheap, because a failed
+# attempt costs one probe rather than a workload sweep, and roughly 1 card in 5 was slow.
+PROBE_ONLY = os.environ.get("PROBE_ONLY", "").strip().lower() in ("1", "true", "yes", "on")
+
+# A card may be this much slower than the reference -- the per-row fastest of its model's prior
+# probes -- and still contribute.
+#
+# Calibration, from eleven RTX 5090s measured against their fastest member:
+#     600W hosts   1.000  1.031  1.041  1.044        575W hosts  1.053  1.053  1.065  1.082
+#     clearly bad  1.159 (clk 0.83)  1.444 (clk 0.62)
+# 1.05 would admit only the overclocked hosts and reject every stock-TDP card, so 1.10: it
+# admits all nine healthy cards regardless of host power limit and still rejects both bad ones,
+# at roughly 1.2 probe attempts per accepted card.
+PERF_TOLERANCE = 1.10
+# Below this many prior probes the screen is skipped and the card proceeds, so that the very
+# first probe -- good or bad -- cannot define "normal" on its own. Two rather than three
+# because older or rarer cards may never accumulate three probes on SaladCloud, and a screen
+# that never engages is worse than one built on a thin reference. The cost is that with two
+# references the fastest is a noisier floor, so an unusually good card tightens the effective
+# threshold for everything after it.
+MIN_REFERENCE_PROBES = 2
 
 # Every artefact is written at the END of a run that has already spent hours computing, so a
 # transient network error or HF rate-limit would otherwise discard all of it. Retries are
@@ -131,6 +157,28 @@ INSTANCE_ID = host_info.get_gpu_uuid()
 # before the others are written.
 RETRIES = 4
 BACKOFF_S = 5
+
+
+def install_signal_logging() -> None:
+    """Make a platform stop distinguishable from a crash.
+
+    A node that vanishes mid-model looks identical in the log whether SaladCloud preempted it,
+    the container hit a memory limit, or the process died on a driver fault -- in every case the
+    last line is just whatever we printed last. SIGTERM is what an orchestrator sends before
+    SIGKILL, so catching it and saying so separates "the platform reclaimed us" from everything
+    else. A hard SIGKILL or an OOM-killer kill still leaves nothing, which is itself informative:
+    no SIGTERM line means it was not a graceful reclaim."""
+    def handler(signum, _frame):
+        name = signal.Signals(signum).name
+        print(f"\n[signal] received {name} -- platform asked this container to stop; "
+              f"work since the last checkpoint is lost", flush=True)
+        sys.stdout.flush()
+        raise SystemExit(128 + signum)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, handler)
+        except Exception:
+            pass
 
 
 def configure_runtime() -> None:
@@ -174,18 +222,44 @@ def list_repo_files(api: HfApi, repo_id: str) -> tuple[bool, list]:
     return ok, list(files) if ok else []
 
 
-def count_existing_versions(files: list, gpu_name: str, workload_name: str) -> tuple[int, bool]:
-    """Returns (count, already_done_by_this_instance) for {gpu}/{workload}_full_*.csv files.
+def load_json(repo_id: str, path: str) -> dict | None:
+    ok, local = with_retries(lambda: hf_hub_download(repo_id, path, repo_type="dataset"),
+                             f"fetch {path}")
+    if not ok:
+        return None
+    try:
+        return json.loads(pathlib.Path(local).read_text())
+    except Exception as e:
+        print(f"  unreadable {path}: {type(e).__name__}: {e}")
+        return None
 
-    The 'already done' flag prevents a Salad restart from re-running work this same physical
-    instance already completed."""
-    prefix = f"{gpu_name}/{workload_name}_full_"
-    versions = [f for f in files if f.startswith(prefix) and f.endswith(".csv")]
-    mine = f"{gpu_name}/{workload_name}_full_{INSTANCE_ID}.csv"
-    return len(versions), mine in versions
+
+def screen_against_reference(sig: dict, files: list, gpu_name: str, repo_id: str) -> bool:
+    """True if this card is close enough to its model's reference to contribute.
+
+    The reference is every other probe already published for the same GPU model. Under
+    MIN_REFERENCE_PROBES the screen is skipped, which is what the PROBE_ONLY pass is for:
+    collect enough probes first, then let workload runs screen against them."""
+    others = [f for f in files
+              if f.startswith(f"{gpu_name}/device_probe_") and f.endswith(".json")
+              and INSTANCE_ID not in f]
+    if len(others) < MIN_REFERENCE_PROBES:
+        print(f"  only {len(others)} reference probe(s) for {gpu_name}; "
+              f"need {MIN_REFERENCE_PROBES} to screen -- proceeding unscreened.")
+        return True
+    refs = [r for r in (load_json(repo_id, f) for f in others) if r]
+    ratio, n = device_probe.compare_to_reference(sig, refs)
+    if ratio is None:
+        print(f"  could not compare against {len(refs)} reference probe(s) -- proceeding.")
+        return True
+    verdict = "OK" if ratio <= PERF_TOLERANCE else "REJECTED"
+    print(f"  performance screen: {ratio:.3f}x the median of {len(refs)} probes "
+          f"over {n} rows (tolerance {PERF_TOLERANCE:.2f}x) -> {verdict}", flush=True)
+    return ratio <= PERF_TOLERANCE
 
 
 def main() -> None:
+    install_signal_logging()
     configure_runtime()
     gpu_name = host_info.get_gpu_name()
     print(f"GPU: {gpu_name}")
@@ -216,80 +290,75 @@ def main() -> None:
         print("aborting — cannot read the dataset repo, so pending work cannot be determined.")
         return
 
-    # For each workload: skip if MAX_VERSIONS already collected globally, or if THIS
-    # specific instance already uploaded its own version (e.g. after a Salad restart
-    # to the same node).
-    pending = []
-    for name, module in WORKLOADS:
-        count, mine_already_uploaded = count_existing_versions(files, gpu_name, name)
-        if mine_already_uploaded:
-            print(f"=== {name} ===  this instance already uploaded; skipping.")
-        elif count >= MAX_VERSIONS:
-            print(f"=== {name} ===  already has {count} versions (>= {MAX_VERSIONS}); skipping.")
-        else:
-            print(f"=== {name} ===  {count}/{MAX_VERSIONS} versions exist; this instance will add one.")
-            pending.append((name, module))
-
-    if not pending:
-        print(f"\nNothing to do for {gpu_name}/{INSTANCE_ID}. Exiting.")
-        return
-
-    # host_info captured on THIS host — tagged with our instance id alongside the workload CSVs.
     upload_bytes(json.dumps(info, indent=2).encode("utf-8"),
                  f"{gpu_name}/host_info_{INSTANCE_ID}.json", token, repo_id)
 
+    # --- probe: always, because it is both the hardware signature and the screen -------------
     probe_path = f"{gpu_name}/device_probe_{INSTANCE_ID}.json"
     if probe_path in files:
-        print(f"\n=== device_probe ===  {INSTANCE_ID} already present; skipping.")
+        print(f"\n=== device_probe ===  {INSTANCE_ID} already present; reusing.")
+        sig = load_json(repo_id, probe_path)
     else:
         print(f"\n=== device_probe ({INSTANCE_ID}) ===")
         sig = device_probe.run_probe()
         print(f"  {len(sig['probes'])} probe rows")
         upload_bytes(json.dumps(sig, indent=2).encode("utf-8"), probe_path, token, repo_id)
 
-    # Each workload checkpoints to _partial_ as it goes and writes _full_ only on completion.
-    # Salad containers reset at arbitrary points, so without checkpoints a node that runs for
-    # hours and is preempted near the end contributes nothing. Both names carry this GPU's own
-    # UUID, so a resume can only ever pick up this card's work -- never another node's.
-    failed = []
-    for name, module in pending:
-        print(f"\n=== {name} ({INSTANCE_ID}) ===")
-        partial = f"{gpu_name}/{name}_partial_{INSTANCE_ID}.csv"
+    if PROBE_ONLY:
+        print("\nPROBE_ONLY set — probe published, not running workloads.")
+        return
 
+    # --- screen: a card unlike its peers should not contribute to their shared dataframe -----
+    if sig is None or not screen_against_reference(sig, files, gpu_name, repo_id):
+        print("exiting so the platform reallocates to a different node.")
+        return
+
+    # --- workloads: ONE dataframe per (gpu model, workload), assembled across nodes ----------
+    # Not one file per card. A card only reaches this point after matching its model's
+    # reference, so its rows are comparable with the ones already there; instance_id records
+    # which card produced each row so they can still be separated afterwards.
+    failed = []
+    for name, module in WORKLOADS:
+        target = f"{gpu_name}/{name}.csv"
         prior, done = None, set()
-        if partial in files:
-            ok, path = with_retries(
-                lambda: hf_hub_download(repo_id, partial, repo_type="dataset"),
-                f"fetch {partial}")
+        if target in files:
+            ok, path = with_retries(lambda t=target: hf_hub_download(repo_id, t, repo_type="dataset"),
+                                    f"fetch {target}")
             if ok:
                 try:
                     prior = pd.read_csv(path)
                     done = set(prior["model"].dropna().unique())
-                    print(f"  resuming this GPU's checkpoint: {len(prior)} rows, "
-                          f"{len(done)} models already done", flush=True)
                 except Exception as e:
-                    print(f"  checkpoint unreadable, starting fresh: {type(e).__name__}: {e}")
+                    print(f"  {target} unreadable, starting fresh: {type(e).__name__}: {e}")
                     prior = None
 
+        todo = [m for m in module.MODELS if m not in done]
+        if not todo:
+            print(f"\n=== {name} ===  complete ({len(done)} models); skipping.")
+            continue
+        print(f"\n=== {name} ({INSTANCE_ID}) ===  {len(done)}/{len(module.MODELS)} models done, "
+              f"{len(todo)} to go", flush=True)
+
         def merged(new: pd.DataFrame) -> pd.DataFrame:
+            new = new.copy()
+            new["instance_id"] = INSTANCE_ID
             return pd.concat([prior, new], ignore_index=True) if prior is not None else new
 
-        def checkpoint(new: pd.DataFrame, _p=partial) -> None:
-            upload_bytes(merged(new).to_csv(index=False).encode("utf-8"), _p, token, repo_id)
+        def checkpoint(new: pd.DataFrame, _t=target) -> None:
+            upload_bytes(merged(new).to_csv(index=False).encode("utf-8"), _t, token, repo_id)
 
         df = merged(module.run_all(skip_models=done or None, checkpoint_fn=checkpoint))
-        target = f"{gpu_name}/{name}_full_{INSTANCE_ID}.csv"
-        if upload_bytes(df.to_csv(index=False).encode("utf-8"), target, token, repo_id):
-            # the partial has served its purpose; leaving it would double the repo's rows
-            with_retries(lambda _p=partial: api.delete_file(_p, repo_id, repo_type="dataset"),
-                         f"delete {partial}")
-        else:
+        if not upload_bytes(df.to_csv(index=False).encode("utf-8"), target, token, repo_id):
             failed.append(target)
-        print(f"  {len(df)} rows")
+        print(f"  {len(df)} rows total in {target}")
 
     if failed:
         print(f"\n{len(failed)} artefact(s) could not be uploaded: " + ", ".join(failed))
 
+    print("\nall assigned workloads complete for this GPU model.")
 
 if __name__ == "__main__":
     main()
+    # Printed only on a normal return. Its absence in a node's log means the process was
+    # killed rather than finishing, without needing to guess from where the output stops.
+    print("\n[exit] main() returned normally", flush=True)
