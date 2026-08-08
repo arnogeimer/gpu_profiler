@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import pandas as pd
 import torch
@@ -131,10 +131,21 @@ PRECISIONS = ['fp32', 'fp16', 'bf16']
 
 
 
-def run_all(only_models: Optional[set] = None) -> pd.DataFrame:
-    """Iterate every config. Returns one row per recorded phase; main.py uploads the result."""
+CHECKPOINT_EVERY = 5   # models between partial uploads
+
+
+def run_all(only_models: Optional[set] = None, skip_models: Optional[set] = None,
+            checkpoint_fn: Optional[Callable[[pd.DataFrame], None]] = None) -> pd.DataFrame:
+    """Iterate every config. Returns one row per recorded phase; main.py uploads the result.
+
+    skip_models are already covered by a checkpoint from this same physical GPU, so they are
+    not re-run. checkpoint_fn is called with the rows so far every CHECKPOINT_EVERY models:
+    Salad containers reset at arbitrary points, and without it a node that runs for hours and
+    is preempted near the end contributes nothing at all."""
     all_rows: list[dict] = []
-    selected = [m for m in MODELS if only_models is None or m in only_models]
+    selected = [m for m in MODELS
+                if (only_models is None or m in only_models)
+                and (skip_models is None or m not in skip_models)]
     prev = None
     for i, model in enumerate(selected, 1):
         prev = progress_line(model, i, len(selected), "image classification", prev)
@@ -148,5 +159,11 @@ def run_all(only_models: Optional[set] = None) -> pd.DataFrame:
                 all_rows.append({**params, "phase": "config_failed", "error": f"{type(e).__name__}: {e}"})
             finally:
                 torch.cuda.empty_cache()
+
+        if checkpoint_fn is not None and i % CHECKPOINT_EVERY == 0:
+            try:
+                checkpoint_fn(pd.DataFrame(all_rows))
+            except Exception as e:
+                print(f"  checkpoint after {model} failed: {type(e).__name__}: {e}", flush=True)
 
     return pd.DataFrame(all_rows)

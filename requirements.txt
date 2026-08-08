@@ -18,6 +18,11 @@ diffusers==0.37.1
 # Support libraries. Left as floors: none of them affect which kernels run, only how results
 # are gathered and written.
 accelerate>=0.30
+# transformers' set-prediction detection losses import scipy.optimize.linear_sum_assignment for
+# the Hungarian match and raise ImportError without it. Locally it arrives transitively via the
+# predictor tooling, which is gitignored and never reaches the container -- so its absence cost
+# every DETR-family detection config on every node until it was pinned here.
+scipy>=1.11
 huggingface-hub>=1.0
 nvidia-ml-py>=12.0
 pandas>=2.0

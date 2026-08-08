@@ -90,7 +90,7 @@ import time
 
 import pandas as pd
 import torch
-from huggingface_hub import HfApi, upload_file
+from huggingface_hub import HfApi, hf_hub_download, upload_file
 
 from profiler import device_probe, host_info
 from profiler.host_info import check_full_power
@@ -241,14 +241,43 @@ def main() -> None:
         print(f"  {len(sig['probes'])} probe rows")
         upload_bytes(json.dumps(sig, indent=2).encode("utf-8"), probe_path, token, repo_id)
 
-    # Each workload uploads once, when it finishes. A failed upload is reported and the sweep
-    # continues to the next workload rather than discarding the ones still to come.
+    # Each workload checkpoints to _partial_ as it goes and writes _full_ only on completion.
+    # Salad containers reset at arbitrary points, so without checkpoints a node that runs for
+    # hours and is preempted near the end contributes nothing. Both names carry this GPU's own
+    # UUID, so a resume can only ever pick up this card's work -- never another node's.
     failed = []
     for name, module in pending:
         print(f"\n=== {name} ({INSTANCE_ID}) ===")
-        df = module.run_all()
+        partial = f"{gpu_name}/{name}_partial_{INSTANCE_ID}.csv"
+
+        prior, done = None, set()
+        if partial in files:
+            ok, path = with_retries(
+                lambda: hf_hub_download(repo_id, partial, repo_type="dataset"),
+                f"fetch {partial}")
+            if ok:
+                try:
+                    prior = pd.read_csv(path)
+                    done = set(prior["model"].dropna().unique())
+                    print(f"  resuming this GPU's checkpoint: {len(prior)} rows, "
+                          f"{len(done)} models already done", flush=True)
+                except Exception as e:
+                    print(f"  checkpoint unreadable, starting fresh: {type(e).__name__}: {e}")
+                    prior = None
+
+        def merged(new: pd.DataFrame) -> pd.DataFrame:
+            return pd.concat([prior, new], ignore_index=True) if prior is not None else new
+
+        def checkpoint(new: pd.DataFrame, _p=partial) -> None:
+            upload_bytes(merged(new).to_csv(index=False).encode("utf-8"), _p, token, repo_id)
+
+        df = merged(module.run_all(skip_models=done or None, checkpoint_fn=checkpoint))
         target = f"{gpu_name}/{name}_full_{INSTANCE_ID}.csv"
-        if not upload_bytes(df.to_csv(index=False).encode("utf-8"), target, token, repo_id):
+        if upload_bytes(df.to_csv(index=False).encode("utf-8"), target, token, repo_id):
+            # the partial has served its purpose; leaving it would double the repo's rows
+            with_retries(lambda _p=partial: api.delete_file(_p, repo_id, repo_type="dataset"),
+                         f"delete {partial}")
+        else:
             failed.append(target)
         print(f"  {len(df)} rows")
 

@@ -1,5 +1,4 @@
 import math
-import statistics
 
 import torch
 
@@ -20,7 +19,7 @@ MAX_ITERS = 200
 
 
 def time_fn(fn, warmup: int, repeats: int, iters: int) -> float:
-    """Median per-iteration CUDA graph ms for function fn.
+    """Fastest per-iteration CUDA graph ms for function fn.
 
     iters is a floor: a cheap fn gets more iterations per capture so one graph launch is
     amortised over enough work (see MIN_GRAPH_MS). Callers whose step already runs for
@@ -63,7 +62,12 @@ def time_fn(fn, warmup: int, repeats: int, iters: int) -> float:
         g.replay()
         torch.cuda.synchronize()
 
-    # repeats timed windows, median so one perturbed window cannot set the result
+    # repeats timed windows, minimum rather than median. Noise here is one-sided -- contention,
+    # a clock drop or a scheduling delay can only make a replay slower, never faster -- so the
+    # fastest window is the cleanest estimate of what the device can do. It also needs only one
+    # uncontended repeat where a median needs six, which matters because the interference seen
+    # in practice is intermittent: on a quiet machine min and median agree to ~1.6%, but on a
+    # config where 9 of 10 repeats were disturbed the median read 9% high and the min did not.
     out = []
     for _ in range(repeats):
         s = torch.cuda.Event(enable_timing=True)
@@ -73,11 +77,11 @@ def time_fn(fn, warmup: int, repeats: int, iters: int) -> float:
         e.record()
         torch.cuda.synchronize()
         out.append(s.elapsed_time(e))
-    return statistics.median(out) / iters
+    return min(out) / iters
 
 
 def kernel_time_fn(fn, warmup: int, repeats: int, iters: int) -> tuple[float, int]:
-    """(median per-iteration ms of GPU kernel time, kernels per iteration) for one step of fn.
+    """(fastest per-iteration ms of GPU kernel time, kernels per iteration) for one step of fn.
 
     For steps a CUDA graph cannot capture -- object detection, where torchvision's
     GeneralizedRCNNTransform and the HF detection loss both build host tensors inside the
@@ -92,7 +96,9 @@ def kernel_time_fn(fn, warmup: int, repeats: int, iters: int) -> tuple[float, in
         fn()
     torch.cuda.synchronize()
 
-    # repeats timed windows, median so one perturbed window cannot set the result
+    # repeats timed windows, minimum for the same reason as time_fn: interference only ever
+    # adds time. The kernel count reported is the one from that fastest window, so the two
+    # numbers describe the same replay.
     out, counts = [], []
     for _ in range(repeats):
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
@@ -104,4 +110,5 @@ def kernel_time_fn(fn, warmup: int, repeats: int, iters: int) -> tuple[float, in
         kernels = [e for e in prof.key_averages() if e.device_type == DeviceType.CUDA]
         out.append(sum(e.self_device_time_total for e in kernels) / 1000.0)
         counts.append(sum(e.count for e in kernels))
-    return statistics.median(out) / iters, round(statistics.median(counts) / iters)
+    best = min(range(len(out)), key=out.__getitem__)
+    return out[best] / iters, round(counts[best] / iters)
