@@ -1,9 +1,15 @@
-"""Image classification: 65 timm models from 1.5M to 630M params, covering CNNs (resnet,
+"""Image classification: 60 timm models from 1.5M to 303M params, covering CNNs (resnet,
 efficientnet, regnety, convnext), transformers (vit, deit, swin, xcit, pvt) and hybrids
 (coatnet, maxvit, mobilevit), plus MLP-only (mixer, resmlp). Each is swept over img_size
-64/128/224 x batch 16/32/64 x fp32/fp16/bf16 = 1755 configs, each timed for one SGD training
+64/128/224 x batch 16/32/64 x fp32/fp16/bf16 = 1620 configs, each timed for one SGD training
 step inside a captured CUDA graph, so the measurement is GPU kernel time with no host dispatch
-in it. Inference is parked in inference.py."""
+in it. Inference is parked in inference.py.
+
+Five models were dropped for cost rather than coverage: on a 5090 they were 59% of the sweep's
+measured time, and vit_huge_patch14_224 alone was 33% while sitting last in the list -- the
+worst possible position for a preemptible container. caformer_b36 is the only one whose
+architecture family goes with it; the rest leave smaller siblings behind (maxvit_tiny,
+efficientnet_b0/b3/b5, swin_tiny/base)."""
 
 import sys
 from dataclasses import dataclass
@@ -116,14 +122,14 @@ MODELS = [
     'vit_tiny_patch16_224', 'vit_small_patch16_224',
     'xcit_tiny_12_p16_224', 'xcit_small_12_p16_224',
     # ~60-100M params
-    'resnet200', 'resnext101_64x4d', 'efficientnet_b7', 'coatnet_2_rw_224',
+    'resnet200', 'resnext101_64x4d', 'coatnet_2_rw_224',
     'regnety_160', 'pvt_v2_b5', 'vit_base_patch16_224', 'deit_base_patch16_224',
-    'swin_base_patch4_window7_224', 'convnext_base', 'convnextv2_base', 'caformer_b36',
+    'swin_base_patch4_window7_224', 'convnext_base', 'convnextv2_base',
     # ~115-200M params
-    'efficientnetv2_l', 'maxvit_base_tf_224', 'wide_resnet101_2', 'dm_nfnet_f1',
-    'regnety_320', 'swin_large_patch4_window7_224', 'convnext_large',
+    'efficientnetv2_l', 'wide_resnet101_2', 'dm_nfnet_f1',
+    'regnety_320', 'convnext_large',
     # ~300M+ params
-    'vit_large_patch16_224', 'beit_large_patch16_224', 'vit_huge_patch14_224',
+    'vit_large_patch16_224', 'beit_large_patch16_224'
 ]
 IMG_SIZES = [64, 128, 224]
 BATCH_SIZES = [16, 32, 64]

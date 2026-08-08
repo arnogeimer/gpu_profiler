@@ -107,9 +107,15 @@ from workloads.robotics import le_world_model
 # inference.py. Uncommenting a line here brings that workload back unchanged.
 WORKLOADS = [
     ("image_classification", image_classification),
-    ("object_detection", object_detection),
     ("audio_classification", audio_classification),
     ("llm_finetune", llm_finetune),
+    # object_detection is parked, not broken. It is the only workload a CUDA graph cannot
+    # capture, so it reports GPU kernel time via the profiler instead -- and detection kernels
+    # are small enough (4.8-22.7us) that the profiler's per-kernel overhead is 20-94% of the
+    # reported time, varying with both config and card speed. That is a confound in exactly the
+    # dimension being predicted. Re-enable once the overhead is calibrated on detection-shaped
+    # kernels; the backbone alone does capture, so both instruments can be compared directly.
+    #("object_detection", object_detection),
     #("vlm_inference", vlm_inference),
     #("le_world_model", le_world_model),
     #("diffusion_inference", diffusion_inference),
