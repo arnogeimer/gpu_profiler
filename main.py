@@ -234,20 +234,49 @@ def load_json(repo_id: str, path: str) -> dict | None:
         return None
 
 
+def _variant(probe: dict) -> tuple:
+    """The silicon identity of a probed card, for deciding whether two probes are comparable.
+
+    gpu_name alone is not enough. The driver does distinguish the RTX 4080 from the 4080 SUPER
+    by name (76 vs 80 SMs), but it reports the 10GB and 12GB RTX 3080 identically despite 68 vs
+    70 SMs -- a ~3% timing gap that sits well inside PERF_TOLERANCE, so the screen would wave it
+    through and chain two different chips into one dataframe."""
+    dev = probe.get("device", {})
+    # VRAM to whole GB: the figure is net of a driver reserve (every 16GB card here reports
+    # 15.99), so exact float equality would be hostage to a driver-version difference, while
+    # the variants this must separate differ by whole gigabytes.
+    vram = dev.get("total_memory_gb")
+    return (dev.get("sm_count"), dev.get("cuda_cores"), dev.get("compute_capability"),
+            round(vram) if isinstance(vram, (int, float)) else None)
+
+
 def screen_against_reference(sig: dict, files: list, gpu_name: str, repo_id: str) -> bool:
     """True if this card is close enough to its model's reference to contribute.
 
-    The reference is every other probe already published for the same GPU model. Under
-    MIN_REFERENCE_PROBES the screen is skipped, which is what the PROBE_ONLY pass is for:
-    collect enough probes first, then let workload runs screen against them."""
+    The reference is every other probe published for the same GPU model *and* the same silicon
+    variant. Under MIN_REFERENCE_PROBES the screen is skipped, which is what the PROBE_ONLY pass
+    is for: collect enough probes first, then let workload runs screen against them."""
     others = [f for f in files
               if f.startswith(f"{gpu_name}/device_probe_") and f.endswith(".json")
               and INSTANCE_ID not in f]
-    if len(others) < MIN_REFERENCE_PROBES:
-        print(f"  only {len(others)} reference probe(s) for {gpu_name}; "
+    refs = [r for r in (load_json(repo_id, f) for f in others) if r]
+
+    # Drop references from a different variant of the same-named card before comparing timings,
+    # so the ratio reflects this card's condition rather than which chip it happens to be.
+    mine = _variant(sig)
+    matched = [r for r in refs if _variant(r) == mine]
+    if len(matched) < len(refs):
+        print(f"  {len(refs) - len(matched)} of {len(refs)} probe(s) under {gpu_name} are a "
+              f"different variant; comparing only against the {len(matched)} matching "
+              f"(sm_count, cuda_cores, cc, vram_gb) = {mine}.")
+    refs = matched
+
+    # Counts loaded, variant-matched probes rather than filenames, so a reference that failed to
+    # download cannot be mistaken for one that agrees with us.
+    if len(refs) < MIN_REFERENCE_PROBES:
+        print(f"  only {len(refs)} matching reference probe(s) for {gpu_name}; "
               f"need {MIN_REFERENCE_PROBES} to screen -- proceeding unscreened.")
         return True
-    refs = [r for r in (load_json(repo_id, f) for f in others) if r]
     ratio, n = device_probe.compare_to_reference(sig, refs)
     if ratio is None:
         print(f"  could not compare against {len(refs)} reference probe(s) -- proceeding.")
