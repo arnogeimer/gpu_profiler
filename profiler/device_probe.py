@@ -729,23 +729,40 @@ if __name__ == "__main__":
 def compare_to_reference(sig: dict, references: list[dict]) -> tuple[float | None, int]:
     """(median row-time ratio of `sig` against `references`, number of rows compared).
 
-    1.0 means this card matches the reference; 1.44 means it is 44% slower. The reference is
-    the per-row FASTEST across every prior probe of the same GPU model -- the same one-sided
-    noise argument time_fn uses, since a card can be degraded but not better than the silicon.
-    Rows are matched on the full identity of the measurement, and only rows present everywhere
-    are used.
+    1.0 means this card is typical for its model; 1.10 means it is 10% slower than typical.
+    The reference is the per-row MEDIAN across every prior probe of the same GPU model. Rows
+    are matched on the full identity of the measurement, and only rows present everywhere used.
 
-    Note what this makes the reference sensitive to: on eleven RTX 5090s the fastest node ran a
-    600W host while stock is 575W, and the stock cards landed at 1.053-1.082 against it. A tight
-    tolerance therefore screens on host power limit as much as on card health -- see
-    PERF_TOLERANCE in main.py.
+    The per-row reference used to be the fastest rather than the median, by analogy with
+    time_fn: interference only ever adds time, so the minimum is the best estimator of what a
+    card can do. That argument holds across repeats of ONE card and does not survive the move
+    across cards, where the spread is genuine boost-bin and cooling variation rather than noise.
+    Taking the min there makes the reference "the luckiest silicon rented so far", which is an
+    order statistic with no fixed point: measured on fourteen RTX 4080 SUPERs, one fixed card
+    read 1.123 against two references and 1.164 against thirteen, drifting further with every
+    probe added. A fixed PERF_TOLERANCE therefore tightened silently as the dataset grew, and
+    would eventually have rejected healthy cards for being merely average -- which for a dataset
+    whose purpose is the distribution of compute times is the one failure that destroys it.
+
+    The median has a fixed point (0.998 at two references, 0.997 at thirteen) and, contrary to
+    the intuition that it needs more samples, is the tighter estimator at EVERY pool size, which
+    matters for older or rarer cards that may never accumulate many probes:
+        4080 SUPER  (14 probes)  N=2  sd 0.0415 vs 0.0423 min    N=13  sd 0.0348 vs 0.0367
+        4070 Ti SUPER (7 probes) N=2  sd 0.0282 vs 0.0352 min    N=6   sd 0.0233 vs 0.0360
+    At N=2 the median is the mean of the two: unbiased, sd 0.71*sigma against 0.83*sigma for the
+    min, which is biased low by 0.56*sigma. Its own failure mode is a degraded card inside a
+    small reference pool, which drags the baseline slow and makes the screen too LENIENT -- the
+    safe direction, since instance_id lets an admitted card be found again afterwards, whereas a
+    wrongly rejected one is simply never measured.
 
     This is what screens a card before committing hours of workload time to it. It works
     because the probe ranks cards almost perfectly: across eleven RTX 5090s the probe ratio and
-    the sustained clock fraction correlated at 0.997, healthy cards landed within 5% of each
-    other, and the two bad ones stood out at 1.16 and 1.44. It also catches what the startup
-    TFLOPS number does not -- that ran before the card settled and reported the worst card as
-    the fastest of the group."""
+    the sustained clock fraction correlated at 0.997, and on fourteen RTX 4080 SUPERs the
+    healthy population spanned 0.945-1.017 while the one degraded card sat at 1.103 -- it held
+    2550MHz against a healthy 2730-2925MHz while drawing its full 320W at 68C, so neither
+    thermal nor contended, just inefficient silicon. It also catches what the startup TFLOPS
+    number does not -- that ran before the card settled and reported the worst card as the
+    fastest of the group."""
     def rows(s):
         out = {}
         for r in s.get("probes", []):
@@ -765,7 +782,7 @@ def compare_to_reference(sig: dict, references: list[dict]) -> tuple[float | Non
         return None, 0
     ratios = []
     for k in common:
-        ref = min(r[k] for r in refs)
+        ref = statistics.median([r[k] for r in refs])
         if ref > 0:
             ratios.append(mine[k] / ref)
     if not ratios:

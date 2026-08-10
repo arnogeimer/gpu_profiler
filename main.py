@@ -133,16 +133,18 @@ INSTANCE_ID = host_info.get_gpu_uuid()
 # attempt costs one probe rather than a workload sweep, and roughly 1 card in 5 was slow.
 PROBE_ONLY = os.environ.get("PROBE_ONLY", "").strip().lower() in ("1", "true", "yes", "on")
 
-# A card may be this much slower than the reference -- the per-row fastest of its model's prior
-# probes -- and still contribute.
+# A card may be this much slower than the reference -- the per-row MEDIAN of its model's prior
+# probes -- and still contribute. 1.0 is a typical card of that model, not the best one seen.
 #
-# Calibration, from eleven RTX 5090s measured against their fastest member:
-#     600W hosts   1.000  1.031  1.041  1.044        575W hosts  1.053  1.053  1.065  1.082
-#     clearly bad  1.159 (clk 0.83)  1.444 (clk 0.62)
-# 1.05 would admit only the overclocked hosts and reject every stock-TDP card, so 1.10: it
-# admits all nine healthy cards regardless of host power limit and still rejects both bad ones,
-# at roughly 1.2 probe attempts per accepted card.
-PERF_TOLERANCE = 1.10
+# Calibration, from fourteen RTX 4080 SUPERs and seven RTX 4070 Ti SUPERs:
+#     4080 SUPER    healthy 0.945-1.017   degraded 1.103 (2550MHz vs a healthy 2730-2925)
+#     4070 Ti SUPER healthy 0.951-1.024   none degraded
+# 1.05 sits in the 8.6-point gap between the slowest healthy card and the degraded one, with
+# margin on both sides. It is tighter than the 1.10 used while the reference was the per-row
+# fastest, and yet admits strictly more healthy cards: against a fastest-reference the whole
+# population was pushed up (worst healthy card 1.078) and drifted higher with every probe
+# added, so 1.10 there was a moving threshold where 1.05 here is a fixed one.
+PERF_TOLERANCE = 1.05
 # Below this many prior probes the screen is skipped and the card proceeds, so that the very
 # first probe -- good or bad -- cannot define "normal" on its own. Two rather than three
 # because older or rarer cards may never accumulate three probes on SaladCloud, and a screen
