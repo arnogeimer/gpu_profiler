@@ -726,12 +726,49 @@ if __name__ == "__main__":
     main()
 
 
-def compare_to_reference(sig: dict, references: list[dict]) -> tuple[float | None, int]:
+# Fraction of each family's rows the screen looks at, largest first. Set per family rather than
+# globally because the families are wildly uneven -- rnn has 1026 rows, pool 36 -- so a global
+# cut would delete the small ones outright. At 0.25, pool keeps 9 rows and elementwise 10.
+HEAVY_FRACTION = 0.25
+
+
+def _heaviest(cost: dict, fraction: float) -> list:
+    """The `fraction` largest rows within each kernel family, ranked by reference time.
+
+    Per family, not pooled: a global top-25% would be almost entirely rnn and attn, and would
+    drop elementwise completely -- which is the family that separates cards by memory bandwidth
+    and the one where a 3090 beats a 4080 SUPER."""
+    if fraction >= 1.0:
+        return list(cost)
+    by_family: dict = {}
+    for k in cost:
+        by_family.setdefault(k[0], []).append(k)
+    out = []
+    for ks in by_family.values():
+        ks.sort(key=lambda k: -cost[k])
+        out += ks[:max(1, int(len(ks) * fraction))]
+    return out
+
+
+def compare_to_reference(sig: dict, references: list[dict],
+                         heavy_fraction: float = HEAVY_FRACTION) -> tuple[float | None, int]:
     """(median row-time ratio of `sig` against `references`, number of rows compared).
 
     1.0 means this card is typical for its model; 1.10 means it is 10% slower than typical.
     The reference is the per-row MEDIAN across every prior probe of the same GPU model. Rows
     are matched on the full identity of the measurement, and only rows present everywhere used.
+
+    Only the heaviest heavy_fraction of each family is compared -- see _heaviest. Screening on
+    every row measures the wrong thing, because the fleet holds two OPPOSITE failure modes and
+    all-rows scoring gets both backwards:
+                                     all rows   heaviest 25%
+        e123c11c (5070 Ti)              0.986        1.133     fine at latency, slow under load
+        f3831185 (3090)                 1.068        1.024     slow at latency, fine under load
+    Small kernels are latency-bound, so they mostly report clock; the workloads spend their time
+    on large ones. Screening on the heavy rows admits f3831185, whose workload rows would have
+    been perfectly good, and rejects e123c11c, whose would not. Measured over 87 cards on twelve
+    models, the healthy population is also tightest at this fraction (sd 0.0185, against 0.0194
+    on all rows and 0.0192 at 10%), and 10% would leave pool and elementwise 3 and 4 rows.
 
     The per-row reference used to be the fastest rather than the median, by analogy with
     time_fn: interference only ever adds time, so the minimum is the best estimator of what a
@@ -780,11 +817,8 @@ def compare_to_reference(sig: dict, references: list[dict]) -> tuple[float | Non
     common = set(mine).intersection(*[set(r) for r in refs])
     if not common:
         return None, 0
-    ratios = []
-    for k in common:
-        ref = statistics.median([r[k] for r in refs])
-        if ref > 0:
-            ratios.append(mine[k] / ref)
+    ref = {k: statistics.median([r[k] for r in refs]) for k in common}
+    ratios = [mine[k] / ref[k] for k in _heaviest(ref, heavy_fraction) if ref[k] > 0]
     if not ratios:
         return None, 0
     return statistics.median(ratios), len(ratios)

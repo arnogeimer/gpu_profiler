@@ -1,16 +1,27 @@
-"""Cloud-node entrypoint. Rents a GPU, checks it is admissible, then writes three artefacts
-per node into the HuggingFace dataset repo.
+"""Cloud-node entrypoint. Rents a GPU, checks it is admissible, then writes its artefacts into
+the HuggingFace dataset repo.
 
 ================================================================================================
 WHAT GETS UPLOADED
 ================================================================================================
 
-  {gpu_name}/host_info_{uuid}.json      one object   -- what hardware produced everything else
-  device_probe/{uuid}.json              one object   -- synthetic kernel sweep, hardware only
-  {gpu_name}/{workload}_full_{uuid}.csv one per row  -- the workload measurements
+  {gpu_name}/host_info_{uuid}.json      one per card  -- what hardware produced everything else
+  {gpu_name}/device_probe_{uuid}.json   one per card  -- synthetic kernel sweep, hardware only
+  {gpu_name}/probe_ext_v2_{uuid}.json   one per card  -- the workload shapes the probe grid
+                                                         never reached (see probe_extension)
+  {gpu_name}/{workload}.csv             one per MODEL -- the workload measurements, appended to
+                                                         across cards and resumed by checkpoint
 
 {uuid} is the physical GPU's NVML UUID (first 8 hex chars), stable across rentals of the same
-card, so all three join on it.
+card, so the per-card artefacts join on it, and the workload CSV carries it as instance_id so
+its rows can be traced back to the card that produced them.
+
+READ, never written by a node:
+
+  reference/{gpu_name}_reference_v1.json  -- the frozen health reference, built offline by
+                                             build_ground_truth.py from a probe snapshot. A card
+                                             screens against this and nothing else; a model with
+                                             no reference file runs no workloads.
 
 ================================================================================================
 THE WORKLOAD CSV -- every column and where it comes from
@@ -88,6 +99,7 @@ import json
 import os
 import pathlib
 import signal
+import statistics
 import sys
 import time
 
@@ -96,7 +108,7 @@ import torch
 from huggingface_hub import HfApi, hf_hub_download, upload_file
 
 import salad
-from profiler import device_probe, host_info
+from profiler import device_probe, host_info, probe_extension
 from profiler.host_info import check_full_power
 from workloads.computer_vision import image_classification, object_detection
 from workloads.audio import audio_classification
@@ -252,41 +264,74 @@ def _variant(probe: dict) -> tuple:
             round(vram) if isinstance(vram, (int, float)) else None)
 
 
-def screen_against_reference(sig: dict, files: list, gpu_name: str, repo_id: str) -> bool:
-    """True if this card is close enough to its model's reference to contribute.
+REFERENCE_VERSION = "v1"
+REFERENCE_PATH = "reference/{gpu}_reference_" + REFERENCE_VERSION + ".json"
 
-    The reference is every other probe published for the same GPU model *and* the same silicon
-    variant. Under MIN_REFERENCE_PROBES the screen is skipped, which is what the PROBE_ONLY pass
-    is for: collect enough probes first, then let workload runs screen against them."""
-    others = [f for f in files
-              if f.startswith(f"{gpu_name}/device_probe_") and f.endswith(".json")
-              and INSTANCE_ID not in f]
-    refs = [r for r in (load_json(repo_id, f) for f in others) if r]
 
-    # Drop references from a different variant of the same-named card before comparing timings,
-    # so the ratio reflects this card's condition rather than which chip it happens to be.
+def load_reference(gpu_name: str, repo_id: str, files: list) -> dict | None:
+    """The frozen health reference for this GPU model, or None if it has none.
+
+    Checked against the repo listing first: most models have no reference and never will
+    (pre-Ampere, or seen once), and letting those fall through to with_retries would spend four
+    attempts and its backoff on a 404 that the listing already answered."""
+    path = REFERENCE_PATH.format(gpu=gpu_name)
+    if path not in files:
+        return None
+    return load_json(repo_id, path)
+
+
+def screen_against_reference(sig: dict, ref: dict) -> bool:
+    """True if this card is close enough to its model's frozen reference to contribute.
+
+    The reference no longer rebuilds itself from whatever probes happen to be published. It is
+    a fixed file, built once from 253 probes by build_ground_truth.py, holding the per-row median
+    over that model's healthy cards across the heaviest 25% of each kernel family. Freezing it is
+    what makes a verdict mean the same thing in six months as it does today, and what lets the
+    probe grid be extended (see probe_extension) without retroactively changing who passed.
+
+    Verified against the screen it replaces: over 240 cards, zero verdicts differ, and the median
+    ratio moves by +0.0005. The threshold travels inside the file rather than being read from
+    PERF_TOLERANCE here, so a reference and the tolerance it was validated at cannot drift apart.
+    """
+    rows = {tuple(r[:-1]): r[-1] for r in ref.get("rows", [])}
+    tol = ref.get("perf_tolerance", PERF_TOLERANCE)
+
+    # A card whose silicon differs from the reference's is not slow, it is a different chip --
+    # the 10GB and 12GB 3080 report the same name at 68 vs 70 SMs. Screening it against the
+    # wrong variant would be measuring the wrong thing in both directions.
     mine = _variant(sig)
-    matched = [r for r in refs if _variant(r) == mine]
-    if len(matched) < len(refs):
-        print(f"  {len(refs) - len(matched)} of {len(refs)} probe(s) under {gpu_name} are a "
-              f"different variant; comparing only against the {len(matched)} matching "
-              f"(sm_count, cuda_cores, cc, vram_gb) = {mine}.")
-    refs = matched
+    theirs = tuple(ref.get("variant", []))
+    if theirs and mine != theirs:
+        print(f"  variant mismatch: this card is {mine}, reference is {theirs} -- "
+              f"cannot screen, so not contributing.")
+        return False
 
-    # Counts loaded, variant-matched probes rather than filenames, so a reference that failed to
-    # download cannot be mistaken for one that agrees with us.
-    if len(refs) < MIN_REFERENCE_PROBES:
-        print(f"  only {len(refs)} matching reference probe(s) for {gpu_name}; "
-              f"need {MIN_REFERENCE_PROBES} to screen -- proceeding unscreened.")
-        return True
-    ratio, n = device_probe.compare_to_reference(sig, refs)
-    if ratio is None:
-        print(f"  could not compare against {len(refs)} reference probe(s) -- proceeding.")
-        return True
-    verdict = "OK" if ratio <= PERF_TOLERANCE else "REJECTED"
-    print(f"  performance screen: {ratio:.3f}x the median of {len(refs)} probes "
-          f"over {n} rows (tolerance {PERF_TOLERANCE:.2f}x) -> {verdict}", flush=True)
-    return ratio <= PERF_TOLERANCE
+    mine_rows = {}
+    for r in sig.get("probes", []):
+        if r.get("ms"):
+            mine_rows[(r.get("probe"), r.get("dtype"), r.get("size"),
+                       r.get("direction"), r.get("kind"), r.get("causal"))] = r["ms"]
+
+    # Missing rows are an error rather than a smaller comparison: the reference pins the exact
+    # row keys, so a probe that no longer emits them is a probe that changed underneath it, and
+    # silently scoring on what survives would compare two different things.
+    missing = [k for k in rows if k not in mine_rows]
+    if missing:
+        print(f"  probe is missing {len(missing)} of {len(rows)} reference rows "
+              f"(e.g. {missing[0]}) -- probe and reference {ref.get('version')} disagree; "
+              f"not contributing.")
+        return False
+
+    ratios = [mine_rows[k] / rows[k] for k in rows if rows[k] > 0]
+    if not ratios:
+        print("  no comparable rows against the reference -- not contributing.")
+        return False
+    ratio = statistics.median(ratios)
+    verdict = "OK" if ratio <= tol else "REJECTED"
+    print(f"  performance screen: {ratio:.3f}x the {ref.get('version')} reference over "
+          f"{len(ratios)} rows, built from {ref.get('n_cards_healthy')} healthy cards "
+          f"(tolerance {tol:.2f}x) -> {verdict}", flush=True)
+    return ratio <= tol
 
 
 def main() -> None:
@@ -324,25 +369,77 @@ def main() -> None:
     upload_bytes(json.dumps(info, indent=2).encode("utf-8"),
                  f"{gpu_name}/host_info_{INSTANCE_ID}.json", token, repo_id)
 
-    # --- probe: always, because it is both the hardware signature and the screen -------------
     probe_path = f"{gpu_name}/device_probe_{INSTANCE_ID}.json"
-    if probe_path in files:
-        print(f"\n=== device_probe ===  {INSTANCE_ID} already present; reusing.")
-        sig = load_json(repo_id, probe_path)
-    else:
+
+    # --- probe-only pass: build the pool a reference can later be frozen from -----------------
+    if PROBE_ONLY:
+        if probe_path in files:
+            print(f"\n=== device_probe ===  {INSTANCE_ID} already probed; nothing to do.")
+            return
         print(f"\n=== device_probe ({INSTANCE_ID}) ===")
         sig = device_probe.run_probe()
         print(f"  {len(sig['probes'])} probe rows")
         upload_bytes(json.dumps(sig, indent=2).encode("utf-8"), probe_path, token, repo_id)
-
-    if PROBE_ONLY:
         print("\nPROBE_ONLY set — probe published, not running workloads.")
         return
 
     # --- screen: a card unlike its peers should not contribute to their shared dataframe -----
-    if sig is None or not screen_against_reference(sig, files, gpu_name, repo_id):
-        print("exiting so the platform reallocates to a different node.")
+    # A model with no frozen reference is one we never collected enough healthy probes for
+    # (pre-Ampere, or a single sighting). It gets no workloads rather than unscreened ones: an
+    # unscreened card is exactly what the reference exists to prevent, and running it would put
+    # timings of unknown provenance into a dataset whose whole purpose is the distribution.
+    ref = load_reference(gpu_name, repo_id, files)
+    if ref is None:
+        print(f"\nno {REFERENCE_VERSION} reference published for {gpu_name} — "
+              "not eligible for workloads.")
         return
+
+    # The allowlist is checked BEFORE probing, not after. INSTANCE_ID is the physical card's NVML
+    # UUID, so a card that was one of the 228 the reference was built from is already known good
+    # and re-probing it would spend ten minutes to compare it against a median it helped define.
+    # This is what the PROBE_ONLY pass bought: by the time workloads run, most cards are known.
+    if INSTANCE_ID in ref.get("healthy_uuids", []):
+        print(f"\n=== screen ===  {INSTANCE_ID} is a known-healthy card in "
+              f"{ref.get('version')}; skipping probe and screen.")
+    else:
+        sig = None
+        if probe_path in files:
+            print(f"\n=== device_probe ===  {INSTANCE_ID} already probed; reusing.")
+            sig = load_json(repo_id, probe_path)
+            if sig is None:
+                # Published but unreadable: a fetch that failed every retry, or a truncated
+                # upload. Re-probe rather than give up -- exiting here would forfeit the rental,
+                # and with it the checkpoint progress waiting behind the screen.
+                print("  stored probe could not be read — re-running it.")
+        if sig is None:
+            print(f"\n=== device_probe ({INSTANCE_ID}) ===")
+            sig = device_probe.run_probe()
+            print(f"  {len(sig['probes'])} probe rows")
+            upload_bytes(json.dumps(sig, indent=2).encode("utf-8"), probe_path, token, repo_id)
+        if not screen_against_reference(sig, ref):
+            print("exiting so the platform reallocates to a different node.")
+            return
+
+    # --- v2 extension: the workload shapes the frozen probe grid never reached ---------------
+    # Written to its own file and never consulted by the screen above. Extending device_probe
+    # in place would strand the probes the v1 reference was built from; collecting the extension
+    # separately keeps every published ratio meaning what it meant, and the files are merged
+    # into a v2 reference offline once enough cards have run.
+    ext_path = f"{gpu_name}/probe_ext_{probe_extension.EXT_VERSION}_{INSTANCE_ID}.json"
+    if ext_path in files:
+        print(f"\n=== probe_extension ===  {INSTANCE_ID} already extended; skipping.")
+    else:
+        print(f"\n=== probe_extension {probe_extension.EXT_VERSION} ({INSTANCE_ID}) ===",
+              flush=True)
+        try:
+            ext = probe_extension.run_extension()
+            n_oom = sum(1 for r in ext["probes"] if r.get("oom"))
+            print(f"  {len(ext['probes'])} rows, {n_oom} OOM")
+            upload_bytes(json.dumps(ext, indent=2).encode("utf-8"), ext_path, token, repo_id)
+        except Exception as e:
+            # The extension is additional data, not a gate. A card that cannot produce it has
+            # already passed the screen, so its workload rows are still wanted.
+            print(f"  extension failed: {type(e).__name__}: {e} — continuing to workloads.")
 
     # --- workloads: ONE dataframe per (gpu model, workload), assembled across nodes ----------
     # Not one file per card. A card only reaches this point after matching its model's

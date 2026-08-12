@@ -185,3 +185,31 @@ masks are redrawn every step. Mitigation: `apply_spec_augment = False` is set on
 every config before the model is built.
 
 
+
+**bf16 batched matmul is much slower than fp16 on Blackwell, and the cost is
+cuBLAS, not silicon.** Across 118 `bmm` shapes, the RTX 5090's advantage over
+the 4090 collapses as precision drops — the median 4090/5090 step time is
+1.538 at fp32, 1.096 at fp16 and 0.995 at bf16, where the 4090 is actually the
+faster card on 60 of 118 rows. Comparing each card against *itself* on the same
+shape shows where it comes from:
+
+| card | median bf16 / fp16 | range |
+|---|---|---|
+| 5080 | 1.355 | 0.27 – 6.61 |
+| 5090 | 1.243 | 0.27 – 6.12 |
+| 4080 SUPER | 1.169 | 0.27 – 5.19 |
+| 4090 | 1.041 | 0.18 – 4.19 |
+
+Every card pays something for bf16 here, but Blackwell pays 24–36% against
+Ada's 4–17%, consistently across two cards of each generation. The per-shape
+range is the tell: 0.27× to 6.6× on one card between two dtypes that use the
+same tensor cores is algorithm selection, not hardware. `b16m768n768k416` is
+the clearest case — the 5090 takes 0.546 ms at bf16 against 0.149 ms at fp16, a
+3.7× penalty, while the 4090 sits at 0.180/0.183 with none, making the 5090 3×
+*slower* than a 4090 on that shape despite being far faster at fp16.
+
+This is a real cost a rented node would pay, so it stays in the dataset rather
+than being corrected out. But it is a property of the pinned
+`torch==2.11.0+cu130` toolchain, not of the cards, and a future CUDA or cuBLAS
+version may change or erase it. Recorded here so that a later re-run showing
+different bf16 numbers reads as a library change rather than a data bug.

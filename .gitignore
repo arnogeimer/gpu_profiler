@@ -32,3 +32,10 @@ predictor/
 profiler/kernel_census.py
 profiler/kernel_normalize.py
 profiler/model_profiler.py
+build_ground_truth.py
+
+# Frozen health references, built locally by build_ground_truth.py from a results/ snapshot and
+# uploaded to the dataset repo. Nodes fetch the one file for their own GPU model from HuggingFace
+# at runtime, so shipping all 23 (2.0 MB) inside the image the Dockerfile clones is dead weight.
+# The uploaded copies are the authority; these are the local staging area.
+reference/
