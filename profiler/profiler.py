@@ -107,8 +107,20 @@ def kernel_time_fn(fn, warmup: int, repeats: int, iters: int) -> tuple[float, in
             torch.cuda.synchronize()
         # Only DeviceType.CUDA rows are kernels. The aten:: rows carry the same device time
         # attributed up the call tree, so summing every row double-counts it (~2x).
-        kernels = [e for e in prof.key_averages() if e.device_type == DeviceType.CUDA]
+        #
+        # Raw events rather than key_averages(): that method groups every event by key to build
+        # a summary table, and we immediately discard the grouping to take a sum and a count.
+        # The aggregate sum equals the sum of the parts, so the two agree exactly -- 243.739 ms
+        # and 3650 kernels either way on fasterrcnn_resnet50_fpn 800px bs2.
+        #
+        # Worth about 20% of this workload's runtime, not more. Whichever accessor is called
+        # first pays ~1.1s for the profiler's lazy post-processing of the raw trace, and that is
+        # unavoidable; key_averages() then adds ~0.6s of grouping on top, and only that part is
+        # saved here. Measured both ways round on one window: events-first gave 1.14s/0.60s,
+        # key_averages-first gave 2.00s/0.04s. A naive one-order benchmark reads this as a 37x
+        # win, which it is not -- end to end a config went from 24s to 19s.
+        kernels = [e for e in prof.events() if e.device_type == DeviceType.CUDA]
         out.append(sum(e.self_device_time_total for e in kernels) / 1000.0)
-        counts.append(sum(e.count for e in kernels))
+        counts.append(len(kernels))
     best = min(range(len(out)), key=out.__getitem__)
     return out[best] / iters, round(counts[best] / iters)

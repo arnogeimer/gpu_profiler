@@ -18,7 +18,7 @@ import torch
 from torchvision.models import detection as tvdet
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from profiler.cuda_monitor import CUDAMonitor, build_row, progress_line
+from profiler.cuda_monitor import CUDAMonitor, build_row, is_oom, progress_line
 from profiler.profiler import kernel_time_fn
 
 import transformers
@@ -32,7 +32,15 @@ from transformers import AutoConfig, AutoModelForObjectDetection
 # loss both build host tensors inside the forward -- so GPU kernel time is read off the profiler
 # instead. Eager wall-clock was 5% host at 800px/bs8 but 62% at 320px/bs2, so roughly a third of
 # this grid would otherwise have been measuring the node's CPU.
-TRAIN_TIMING = (3, 10, 2)
+# 5 repeats, not the 10 the graph-captured workloads use. A repeat is nearly free under CUDA
+# graph replay but costs ~1.5s here, because reading any result off the profiler forces it to
+# post-process the raw trace -- so repeats, not the steps, set this workload's runtime. The
+# measurement does not need them: over ten repeats of fasterrcnn_resnet50_fpn 800px bs2 the
+# spread was 121.69-121.97ms plus one 127.23ms outlier, and min-of-3 returned 121.69, identical
+# to min-of-10. retinanet 320px bs2 agreed to 0.04%. 5 keeps margin for rejecting interference
+# on a shared cloud node while halving the cost; with the raw-event change above it takes a
+# config from ~24s to ~9s, and the 324-config sweep from ~3h to ~1h per GPU.
+TRAIN_TIMING = (3, 5, 2)
 TIMING_METHOD = "kernel_sum"   # the only workload not measured by CUDA graph capture
 
 NUM_CLASSES = 16
@@ -140,13 +148,15 @@ def run(hyperparams: Hyperparams) -> list[dict]:
     train_avg_ms, kernels, oom, err = None, None, False, ""
     try:
         train_avg_ms, kernels = kernel_time_fn(step, *TRAIN_TIMING)
-    except torch.cuda.OutOfMemoryError:
-        oom = True   # recorded below rather than raised, so the sweep keeps going
     except Exception as e:
         # Broader than the other workloads on purpose: the set-prediction losses raise
         # ValueError (not RuntimeError) when a prediction goes non-finite, which would
-        # otherwise escape run() and lose the monitor metrics for this row.
-        err = f"train_failed: {type(e).__name__}: {e}"
+        # otherwise escape run() and lose the monitor metrics for this row. is_oom covers both
+        # routes an out-of-VRAM config arrives by; see cuda_monitor.is_oom.
+        if is_oom(e):
+            oom = True   # recorded below rather than raised, so the sweep keeps going
+        else:
+            err = f"train_failed: {type(e).__name__}: {e}"
     finally:
         rows.append(build_row(hyperparams, "train", metrics=monitor.stop(oom=oom),
                               error=err, avg_ms=train_avg_ms,
