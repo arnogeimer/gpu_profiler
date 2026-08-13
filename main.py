@@ -195,10 +195,34 @@ def install_signal_logging() -> None:
             pass
 
 
+# Cap torch's allocator below the physical limit so that a config which does not fit raises
+# OutOfMemoryError instead of thrashing. At 1.0 -- the default, which is what this was -- torch
+# never raises: on the last allocation it flushes its cache and retries cudaMalloc against a full
+# device, over and over, and the config still "succeeds" while reporting a time that is mostly
+# allocator churn. Measured on the first three nodes, that produced timings 30-66x above trend:
+#
+#   wav2vec2-large, batch 4, fp16, RTX 3090      2s     4s     8s     16s      30s
+#     step time (ms)                             51     84    148     326   21766
+#     peak device memory (%)                     44     51     67      96     100
+#
+# 16s at 96% is on trend; 30s at 100% is not a measurement of the model at all. Across the three
+# nodes 14% of audio rows sat at 100% and consumed 94% of the wall time -- 8.4 hours of 8.9 --
+# and image_classification had it too, which is why a 16GB 5070 Ti took 5.0h against a 24GB
+# 3090's 2.0h on identical work. Left alone that enters the dataset as "Blackwell is slower".
+#
+# Both workloads already catch OutOfMemoryError and record an oom row; those handlers simply
+# never fired (oom=0 in every CSV). Capping restores them, which turns 20 wasted minutes per
+# config into an immediate, correctly-labelled skip.
+#
+# 0.95 rather than lower because the boundary is sharp: 96% still measured cleanly above, so a
+# tighter cap would discard valid rows near the top of the range rather than only the bad ones.
+MEMORY_FRACTION = 0.995
+
+
 def configure_runtime() -> None:
     """Global torch settings applied once before any workload runs."""
     torch.backends.cudnn.benchmark = False
-    torch.cuda.set_per_process_memory_fraction(1.0, 0)
+    torch.cuda.set_per_process_memory_fraction(MEMORY_FRACTION, 0)
 
 
 def with_retries(fn, what: str) -> tuple[bool, object]:

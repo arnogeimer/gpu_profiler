@@ -16,7 +16,7 @@ import pandas as pd
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from profiler.cuda_monitor import CUDAMonitor, build_row, progress_line
+from profiler.cuda_monitor import CUDAMonitor, build_row, is_oom, progress_line
 from profiler.profiler import time_fn
 
 import transformers
@@ -24,6 +24,37 @@ transformers.logging.set_verbosity_error()
 warnings.filterwarnings("ignore")
 from transformers import AutoConfig, AutoModelForAudioClassification
 from transformers.initialization import no_init_weights
+from transformers.models.wavlm import modeling_wavlm
+
+
+def _wavlm_compute_bias(self, query_length: int, key_length: int) -> torch.Tensor:
+    """WavLM's relative-position bias, built on the GPU instead of on the host.
+
+    Stock transformers builds the position buckets with two device-less torch.arange calls and
+    copies the result to the GPU at the end of compute_bias. That copy is illegal inside a CUDA
+    graph capture ("Cannot copy between CPU and CUDA tensors ... unless the CPU tensor is
+    pinned"), so every WavLM config failed -- 45/45 rows on all three nodes. Nothing about the
+    model placement causes it: all parameters and buffers are already on the GPU, and the tensor
+    is constructed fresh inside the forward pass on every call, so no amount of .to() or pinning
+    upstream reaches it.
+
+    Building the buckets on-device removes the copy and the model captures normally.
+
+    Note what this changes about the measurement. The bucket arithmetic now runs as GPU kernels
+    over a (query_length x key_length) index tensor -- 1499**2 at 30 s -- where stock WavLM runs
+    it on the host, invisible to a GPU-time measurement. It is not a distortion of an existing
+    number, since stock WavLM cannot be captured at all and so has no number; but WavLM rows do
+    carry per-layer work that no other model in the suite carries, which matters when comparing
+    across models rather than across cards. SEW-D fails the same way for its own reasons and is
+    left out rather than patched twice."""
+    device = self.rel_attn_embed.weight.device
+    context_position = torch.arange(query_length, dtype=torch.long, device=device)[:, None]
+    memory_position = torch.arange(key_length, dtype=torch.long, device=device)[None, :]
+    bucket = self._relative_positions_bucket(memory_position - context_position)
+    return self.rel_attn_embed(bucket).permute([2, 0, 1])
+
+
+modeling_wavlm.WavLMAttention.compute_bias = _wavlm_compute_bias
 
 
 # (warmup, repeats, iters) handed to time_fn. The step is measured inside a captured CUDA
@@ -109,10 +140,12 @@ def run(hyperparams: Hyperparams) -> list[dict]:
         step()      # materialise gradients and the momentum buffer before the capture
         torch.cuda.synchronize()
         train_avg_ms = time_fn(step, *TRAIN_TIMING)
-    except torch.cuda.OutOfMemoryError:
-        oom = True   # recorded below rather than raised, so the sweep keeps going
     except RuntimeError as e:
-        err = f"train_failed: {e}"
+        # is_oom covers both routes an out-of-VRAM config arrives by; see cuda_monitor.is_oom.
+        if is_oom(e):
+            oom = True   # recorded below rather than raised, so the sweep keeps going
+        else:
+            err = f"train_failed: {e}"
     finally:
         rows.append(build_row(hyperparams, "train", metrics=monitor.stop(oom=oom),
                               error=err, avg_ms=train_avg_ms, timing_method=TIMING_METHOD))
@@ -122,13 +155,15 @@ def run(hyperparams: Hyperparams) -> list[dict]:
     return rows
 
 
+# The SEW-D family is absent on purpose. Like WavLM it builds position buckets on the host
+# inside the attention path, so CUDA graph capture rejects the copy and all 45 configs fail --
+# sew-d-tiny and sew-d-mid each failed 45/45 rows on all three nodes, costing ~5 min per node to
+# produce nothing. WavLM is back because _wavlm_compute_bias above fixes it for that family;
+# SEW-D would need its own patch against different code, and is two small models.
 MODELS = [
     # small (<50M)
     'ntu-spml/distilhubert',
-    'asapp/sew-d-tiny-100k',
     'asapp/sew-tiny-100k',
-    # mid (~80M)
-    'asapp/sew-d-mid-100k',
     # base (~94M)
     'facebook/wav2vec2-base',
     'facebook/hubert-base-ls960',

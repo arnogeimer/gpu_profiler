@@ -49,6 +49,20 @@ def progress_line(model: str, i: int, total: int, label: str, prev_start: float 
     return now
 
 
+def is_oom(exc: BaseException) -> bool:
+    """True if exc is a config running out of VRAM, by either of the two routes it arrives by.
+
+    torch raises OutOfMemoryError when its own allocator refuses -- which is what the
+    per-process memory fraction triggers. But when the fraction sits close to the physical
+    limit, the driver can get there first, and an allocation made during CUDA graph capture
+    then comes back as a plain RuntimeError carrying cudaErrorMemoryAllocation. Same event,
+    different exception type, and catching only the first left rows with no timing and oom
+    False -- indistinguishable from a code fault in the CSV."""
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
 def build_row(hp, phase: str, metrics: dict | None = None,
               error: str = "", avg_ms: float | None = None,
               timing_method: str = "", kernel_count: int | None = None) -> dict:

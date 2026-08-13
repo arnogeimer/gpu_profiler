@@ -23,7 +23,7 @@ import torch.nn as nn
 import timm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from profiler.cuda_monitor import CUDAMonitor, build_row, progress_line
+from profiler.cuda_monitor import CUDAMonitor, build_row, is_oom, progress_line
 from profiler.profiler import time_fn
 
 
@@ -93,10 +93,12 @@ def run(hyperparams: Hyperparams) -> list[dict]:
         step()      # materialise gradients and the momentum buffer before the capture
         torch.cuda.synchronize()
         train_avg_ms = time_fn(step, *TRAIN_TIMING)
-    except torch.cuda.OutOfMemoryError:
-        oom = True   # recorded below rather than raised, so the sweep keeps going
     except RuntimeError as e:
-        err = f"train_failed: {e}"
+        # is_oom covers both routes an out-of-VRAM config arrives by; see cuda_monitor.is_oom.
+        if is_oom(e):
+            oom = True   # recorded below rather than raised, so the sweep keeps going
+        else:
+            err = f"train_failed: {e}"
     finally:
         rows.append(build_row(hyperparams, "train", metrics=monitor.stop(oom=oom),
                               error=err, avg_ms=train_avg_ms, timing_method=TIMING_METHOD))
@@ -107,11 +109,20 @@ def run(hyperparams: Hyperparams) -> list[dict]:
 
 
 MODELS = [
+    # Deliberately NOT smallest-first. These eight produced the most memory-saturated rows on
+    # the first three nodes -- 10 to 16 configs each at 100% of VRAM, where the allocator used
+    # to grind instead of raising and reported times 30-66x above trend. With the memory cap in
+    # main.configure_runtime they must now come back as oom rows in seconds. Running them first
+    # means a node shows within a few minutes whether that holds, rather than after an hour of
+    # small models. Note maxvit_tiny is here despite the name: it saturated 10 configs.
+    'coatnet_2_rw_224', 'efficientnetv2_l', 'beit_large_patch16_224', 'convnext_large',
+    'convnextv2_base', 'vit_large_patch16_224', 'maxvit_tiny_tf_224', 'pvt_v2_b5',
+    # the rest, smallest first
     'coatnet_0_rw_224', 'coatnet_1_rw_224', 'convnext_small', 'convnext_tiny',
     'deit_small_patch16_224', 'deit_tiny_patch16_224', 'densenet121',
     'efficientnet_b0', 'efficientnet_b3', 'efficientnet_b5',
     'efficientnetv2_m', 'efficientnetv2_s',
-    'fastvit_t8', 'fastvit_t12', 'maxvit_tiny_tf_224', 'mixer_b16_224',
+    'fastvit_t8', 'fastvit_t12', 'mixer_b16_224',
     'mobilenetv2_100', 'mobilenetv3_large_100', 'mobilenetv3_small_100',
     'mobilevit_xxs', 'mobilevit_xs', 'mobilevit_s', 'mobilevitv2_100',
     'nfnet_l0', 'pvt_v2_b0', 'pvt_v2_b2',
@@ -122,14 +133,11 @@ MODELS = [
     'vit_tiny_patch16_224', 'vit_small_patch16_224',
     'xcit_tiny_12_p16_224', 'xcit_small_12_p16_224',
     # ~60-100M params
-    'resnet200', 'resnext101_64x4d', 'coatnet_2_rw_224',
-    'regnety_160', 'pvt_v2_b5', 'vit_base_patch16_224', 'deit_base_patch16_224',
-    'swin_base_patch4_window7_224', 'convnext_base', 'convnextv2_base',
+    'resnet200', 'resnext101_64x4d',
+    'regnety_160', 'vit_base_patch16_224', 'deit_base_patch16_224',
+    'swin_base_patch4_window7_224', 'convnext_base',
     # ~115-200M params
-    'efficientnetv2_l', 'wide_resnet101_2', 'dm_nfnet_f1',
-    'regnety_320', 'convnext_large',
-    # ~300M+ params
-    'vit_large_patch16_224', 'beit_large_patch16_224'
+    'wide_resnet101_2', 'dm_nfnet_f1', 'regnety_320',
 ]
 IMG_SIZES = [64, 128, 224]
 BATCH_SIZES = [16, 32, 64]
