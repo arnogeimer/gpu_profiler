@@ -56,6 +56,22 @@ def run(hyperparams: Hyperparams) -> list[dict]:
         # These models are all dense (no value-dependent routing), so uninitialized weights leave
         # every measured step unchanged -- nothing here branches on a value or validates one.
         cfg = AutoConfig.from_pretrained(hyperparams.model)
+
+        # A sequence longer than the model's learned position table indexes past the end of it,
+        # and the embedding gather fails as a DEVICE-SIDE ASSERT rather than a Python exception:
+        # the CUDA context is poisoned, every later call fails, and the process is unrecoverable.
+        # So this has to be prevented, not caught. gpt2 and distilgpt2 are the only two of the 27
+        # with a fixed table (n_positions=1024) -- everything else is RoPE or ALiBi and has no
+        # limit worth checking -- and gpt2 is first in MODELS, so the assert killed llm_finetune
+        # at config 1 on every node and object_detection never ran at all.
+        max_pos = getattr(cfg, "max_position_embeddings", None) or getattr(cfg, "n_positions", None)
+        if max_pos and hyperparams.sequence_length > max_pos:
+            rows.append(build_row(
+                hyperparams, "setup", timing_method=TIMING_METHOD,
+                error=f"sequence_length {hyperparams.sequence_length} exceeds the model's "
+                      f"{max_pos} position embeddings"))
+            return rows
+
         with no_init_weights():
             base = AutoModelForCausalLM.from_config(cfg, dtype=dtype)
         lora_cfg = LoraConfig(

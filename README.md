@@ -73,11 +73,93 @@ Example from our data: `coatnet_1_rw_224` at fp32 / bs=64 / 224×224 on RTX 4080
 without any error, because cuDNN gave up the fastest conv algorithm to free
 workspace memory.
 
-The dataset stores `oom=True` only for the cleanly-failed runs; thrashing rows
-are kept as honest "this is what happens when your VRAM is tight" measurements,
-and we identify them post-hoc as rows whose `avg_time_ms` exceeds 10× the
-fastest GPU's time for the same (model, img_size, batch_size, precision)
-config.
+We originally kept thrashing rows as honest "this is what happens when your VRAM
+is tight" measurements, identified post-hoc as rows exceeding 10× the fastest
+GPU's time for the same config. **That was the wrong call, and the first three
+workload nodes showed why.**
+
+Most of the slowdown was not cuDNN choosing a slower algorithm. It was the
+caching allocator itself: with `set_per_process_memory_fraction` left at its
+default of `1.0`, torch never raises — on the last allocation it flushes its
+cache and retries `cudaMalloc` against a full device, over and over, and the
+config still "succeeds" while reporting a time that is mostly allocator churn.
+The tell is that the timing tracks memory rather than shape:
+
+| wav2vec2-large, bs=4, fp16, RTX 3090 | 2 s | 4 s | 8 s | 16 s | 30 s |
+|---|---:|---:|---:|---:|---:|
+| step time (ms) | 51 | 84 | 148 | 326 | **21 766** |
+| peak device memory (%) | 44 | 51 | 67 | 96 | **100** |
+
+16 s at 96% is on trend; 30 s at 100% is 66× above it. wav2vec2-**base** at 30 s
+uses 55% of memory and lands exactly on trend — same family, same config, no
+wall. Across the three nodes, **14% of audio rows sat at 100% and consumed 94%
+of the wall time — 8.4 hours of 8.9**.
+
+Worse, the effect is a function of VRAM, so it corrupts precisely the
+cross-hardware comparison the dataset exists for. The same config records
+~21 800 ms on a 24 GB card, would run at roughly 600 ms on a 32 GB one, and OOMs
+on 8 GB. Image classification had it too, which is why a 16 GB RTX 5070 Ti spent
+**5.04 h** against a 24 GB RTX 3090's **1.98 h** on identical work — left alone,
+that enters the dataset as "Blackwell is slower than Ampere".
+
+Mitigation: `main.MEMORY_FRACTION = 0.995` caps the allocator just below the
+physical limit, so a config that does not fit raises instead of grinding. 0.995
+rather than lower because the boundary is sharp — 96% still measured cleanly, so
+a tighter cap would discard valid rows near the top of the range rather than only
+the bad ones. The 315 pre-fix rows at ≥99.9% memory were deleted from the dataset
+rather than kept.
+
+**A capped allocator exposed a second bug: OOM arrives as two different
+exceptions.** Both workloads caught `torch.cuda.OutOfMemoryError`, which is what
+torch's own allocator raises. But when the cap sits close to the physical limit,
+the *driver* can get there first, and an allocation made during CUDA graph
+capture then comes back as a plain `RuntimeError` carrying
+`cudaErrorMemoryAllocation`. Same event, different type. Catching only the first
+left rows with no timing and `oom=False` — indistinguishable in the CSV from a
+code fault. `profiler.cuda_monitor.is_oom` now covers both, and after the fix the
+slowest single config anywhere is 6.5 s rather than 20+ minutes, with zero
+unlabelled failures.
+
+**A residue survives the cap, and `max_memory_used_pct` cannot find it.** Capping
+the allocator converts the clear misses into `oom` rows, but a config that lands
+*just* inside the budget still completes — with less workspace than cuDNN wants,
+so it picks a slower algorithm and returns a plausible-looking number that
+measures the fallback rather than the model. This is the original "thrashing"
+mechanism, now confined to a narrow band instead of dominating the sweep: across
+381 configs re-run after the fix, exactly one regressed.
+
+Peak memory does not identify these. An RTX 3090 Ti ran `vit_large` 224/32/fp32
+at 99.3% of VRAM and returned a clean 786 ms; healthy rows routinely read 100%,
+because the figure is a whole-device measure that includes the CUDA context
+while the cap applies only to torch's own allocations.
+
+**The fp32/fp16 ratio does identify them.** Low precision is faster by a stable
+factor across the fleet, so a config where fp32 alone explodes — while its fp16
+and bf16 siblings stay normal and agree with each other — is memory-constrained
+rather than slow:
+
+| gpu | config | fp32 | fp16 | ratio |
+|---|---|---:|---:|---:|
+| RTX 4080 SUPER | convnext_large 224/32 | 13 032 ms | 138 ms | **94.6×** |
+| RTX 5070 Ti | vit_large 224/32 | 9 826 ms | 189 ms | **52.1×** |
+| RTX 5070 Ti | regnety_080 224/64 | 2 080 ms | 120 ms | **17.3×** |
+| RTX 3090 Ti | vit_large 224/64 | 7 468 ms | 463 ms | **16.1×** |
+
+Over 692 (gpu, model, img_size, batch_size) groups the ratio is 1.68 median,
+2.60 at p90, 6.24 at p99 — and then a gap to 16.1. Four groups sit above it,
+0.6% of the total, every one a 224 px large-batch fp32 config at the corner of
+its card's capacity. Note the 3090 Ti case: with 24 GB it hits the wall one batch
+size later than the 16 GB cards rather than avoiding it, so this is not a
+small-VRAM problem, it is a "config that just barely fits" problem and every card
+has one somewhere.
+
+Mitigation is post-hoc, since the row is only recognisable once its siblings
+exist: **drop groups whose `fp32/fp16` exceeds 8**. The threshold sits in the gap
+between the healthy p99 and the lowest artefact, so nothing about it is a
+judgement call. Two limits — it needs both precisions present, so it cannot
+classify a config whose fp16 sibling OOM'd, and it deliberately does not catch a
+card that is uniformly slow at every precision. That is the device-probe screen's
+job, not this one's.
 
 **A large share of what we were timing was the host CPU, not the GPU.** Kernel
 launches are dispatched from Python: every op walks the torch dispatcher into
