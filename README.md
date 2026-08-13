@@ -145,21 +145,79 @@ rather than slow:
 | RTX 5070 Ti | regnety_080 224/64 | 2 080 ms | 120 ms | **17.3×** |
 | RTX 3090 Ti | vit_large 224/64 | 7 468 ms | 463 ms | **16.1×** |
 
-Over 692 (gpu, model, img_size, batch_size) groups the ratio is 1.68 median,
-2.60 at p90, 6.24 at p99 — and then a gap to 16.1. Four groups sit above it,
-0.6% of the total, every one a 224 px large-batch fp32 config at the corner of
-its card's capacity. Note the 3090 Ti case: with 24 GB it hits the wall one batch
-size later than the 16 GB cards rather than avoiding it, so this is not a
-small-VRAM problem, it is a "config that just barely fits" problem and every card
-has one somewhere.
+Note the 3090 Ti case: with 24 GB it hits the wall one batch size later than the
+16 GB cards rather than avoiding it, so this is not a small-VRAM problem, it is a
+"config that just barely fits" problem and every card has one somewhere.
 
 Mitigation is post-hoc, since the row is only recognisable once its siblings
-exist: **drop groups whose `fp32/fp16` exceeds 8**. The threshold sits in the gap
-between the healthy p99 and the lowest artefact, so nothing about it is a
-judgement call. Two limits — it needs both precisions present, so it cannot
-classify a config whose fp16 sibling OOM'd, and it deliberately does not catch a
-card that is uniformly slow at every precision. That is the device-probe screen's
-job, not this one's.
+exist. `dataset_cleanup.py` implements it in two stages; the module docstring
+carries the full derivation and the current numbers.
+
+**Stage 1 — VRAM class.** If any card of a VRAM class OOM'd on a config, the
+config is marked OOM for every card of that class. Fitting is a property of the
+config and the capacity, so a lone survivor is a card that got lucky with
+allocator ordering. This is exactly true where it can be checked: across image
+classification's 4 860 (config, VRAM class) cells there is **not one
+disagreement**, so the stage is a no-op there and rests on 4 860 confirmations.
+Audio has 16 mixed cells and the stage resolves them, removing 30 timings.
+
+It is conservative rather than precise — judged against each card's own typical
+speed factor, roughly two thirds of those 30 were measuring cleanly. That is the
+right trade here: every one sits at 100% memory, and a config that only runs on
+the luckiest card in its class is not a runtime to promise a node. Note that
+"same VRAM" is not the same capacity — the 16 GB class spans 16 302–16 379 MiB,
+so the 4060 Ti genuinely fits configs its classmates cannot, and those rows are
+discarded regardless.
+
+**Stage 2 — precision ratio**, for configs that degrade a whole class without
+OOMing any of it, where stage 1 sees nothing.
+
+**A flat `fp32/fp16 > 8` was the first version of stage 2 and no longer holds.**
+On the 692 groups it was fitted to, the healthy p99 was 6.24 and the lowest
+artefact 16.1. At 7 637 groups that gap has closed to 7.57 / 7.98, and the
+quantity being thresholded turns out to depend on the model: convnext at 224 px
+legitimately runs 3.0–7.6 on every card in the fleet, so a cut placed for
+convnext is far too loose for a model whose baseline is 1.3.
+
+The rule is now **relative to the same config on other cards**, which removes the
+model term, plus two rules covering where that fails. A group is dropped if any
+fires:
+
+| rule | baseline | covers |
+|---|---|---|
+| `peer_relative` | median ratio across all cards at this config | a minority of cards affected |
+| `clean_relative` | median across cards **not** at ≥99% memory | a majority affected |
+| `raw` | none | no usable peer set |
+
+`clean_relative` exists because the peer median is itself a measurement, and at a
+config sitting on the capacity boundary of a whole VRAM class it is contaminated.
+At `vit_large 224/32` the four 24 GB+ cards run 2.70–3.18 while all six 16 GB
+cards run 7.98–53.99 at 100% memory: six of ten peers are artefacts, the median
+is 9.59, and the worst-affected card scores 0.83 — healthier than healthy.
+
+**A second arm, `bf16/fp16`, covers the blind spot.** The fp32 arm cannot classify
+a config whose fp16 sibling OOM'd, since then there is no denominator — and that
+is precisely where the largest configs live. bf16 and fp16 have identical
+footprints and identical tensor-core throughput on every card here, so the ratio
+exists wherever either precision does and its healthy spread is far tighter:
+peer-relative p99 of 1.13 against 1.43 for fp32/fp16.
+
+Only the numerator's row is removed, not the whole group. A high ratio means the
+numerator is slow *relative to* the denominator, and the denominator is what
+established that — were it degraded too the ratio would sit near 1 and nothing
+would fire. Noise is one-sided (minimum of repeats), so "fp16 was anomalously
+fast" is not an available explanation.
+
+**Together the two stages remove 68 of 23 282 timings (0.29%)** — 30 by VRAM
+class, 38 by precision ratio. They overlap usefully: with stage 1 applied first
+the audio bf16 arm flags nothing at all, because the case it was built for
+(RTX 4060 Ti, `wavlm-large` 16 s batch 4, bf16 at 4.58× its fp16 sibling) is one
+stage 1 already removes — its five classmates OOM'd on that config.
+
+What none of it catches is a card uniformly slow at every precision; that is the
+device-probe screen's job. And the boundary is fuzzy: degradation is continuous,
+and at `whisper-medium` 16 s batch 8 every 16 GB card is affected, from 9.80 down
+to 3.43, so any cut inside that range separates siblings that failed the same way.
 
 **A large share of what we were timing was the host CPU, not the GPU.** Kernel
 launches are dispatched from Python: every op walks the torch dispatcher into
