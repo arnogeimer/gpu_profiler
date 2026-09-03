@@ -324,20 +324,39 @@ def relabel_escaped_ooms(df: pd.DataFrame) -> pd.DataFrame:
     filtering on phase. Stage 1 misses them too -- it looks for `oom` -- so a config the whole
     class OOM'd on looks unanimously healthy.
 
-    The workload code is fixed (see llm_finetune.run), so this only repairs rows already
-    collected; on a clean sweep it matches nothing. What it cannot restore is the memory readings,
-    since those rows never reached the monitor: they carry `oom` and no `max_memory_used_*`. That
-    is enough for stage 1, which only needs the flag, and irrelevant to stages 2 and 3, which look
-    only at timings.
+    Two routes in, matching the two cuda_monitor.is_oom now distinguishes at collection time:
 
-    Deliberately conservative: it requires an untimed row, an OOM message, and no existing flag.
-    A row that already carries `oom` is left alone, and one with a timing is never touched however
-    its error reads."""
+      text     the error literally says "out of memory" -- the llm_finetune case above, an OOM
+               that escaped the guarded region as plain text with no `oom` flag at all.
+      pressure the error says nothing about memory, but the row's OWN max_memory_used_pct sits
+               at or above MEM_PRESSURE_PCT. convnextv2_base logged "!handles_.at(i) INTERNAL
+               ASSERT FAILED ... CUDACachingAllocator.cpp" and "CUDA driver error: device not
+               ready" at 100.0% both times -- a card pushed to its cap can fail through the
+               allocator's graph-pool bookkeeping or the driver instead of raising
+               OutOfMemoryError, and neither message is text-matchable.
+
+    The pressure route only ever matches a row that reached the monitor, because it needs a real
+    reading to act on -- a row that escaped run() entirely (like the llm_finetune case, or a
+    capture-poisoned cascade after an actual OOM corrupts process-global state) carries no
+    max_memory_used_pct and NaN >= anything is False, so it is invisible to this route and can
+    only be recovered by the text route, if at all.
+
+    The collection code now classifies both routes directly (see cuda_monitor.is_oom), so like
+    the original text route this only repairs rows collected before that fix; a node running the
+    current code never produces one.
+
+    Deliberately conservative: it requires an untimed row, a non-empty error, no existing flag,
+    and one of the two routes above. A row that already carries `oom` is left alone, and one with
+    a timing is never touched however its error reads."""
     out = df.copy()
     err = out.error.fillna("").astype(str)
-    hit = (out.avg_time_ms.isna()
-           & err.str.contains("out of memory", case=False, regex=False)
-           & ~out.oom.fillna(False))
+    escaped_text = err.str.contains("out of memory", case=False, regex=False)
+    if "max_memory_used_pct" in out.columns:
+        pressured = out.max_memory_used_pct.fillna(-1) >= MEM_PRESSURE_PCT
+    else:
+        pressured = False
+    hit = (out.avg_time_ms.isna() & (err != "") & ~out.oom.fillna(False)
+           & (escaped_text | pressured))
     if not hit.any():
         return out
     # Normalised to whatever phase this workload's real measurements carry, so a repaired row is

@@ -17,6 +17,38 @@ from torch.profiler import ProfilerActivity, profile
 MIN_GRAPH_MS = 2.0
 MAX_ITERS = 200
 
+# Capture cannot reclaim cache the way eager execution can -- the allocator is not allowed to
+# cudaFree an unused cached block while a capture is active (see pytorch/pytorch#159594), so a
+# config that just barely fits under eager warmup can still overrun once addresses are locked in
+# under torch.cuda.graph(). When THAT happens, the failure does not surface as an ordinary
+# OutOfMemoryError -- it corrupts the allocator's own graph-pool bookkeeping instead
+# (`!handles_.at(i) INTERNAL ASSERT FAILED`, an open, unresolved PyTorch bug: pytorch/pytorch
+# #166234, #68985) and every later capture in the process fails identically. convnextv2_base
+# fp32 at 128px batch 64 took a whole node's remaining sweep down this way, logged at 100%
+# device memory. _clear_capture_state's repair does not help here: it targets a different piece
+# of state (the RNG generator's capture-bound flag), and a repair attempt is itself a capture,
+# which walks the same corrupted bookkeeping and fails the same way.
+#
+# So this is checked BEFORE capture rather than repaired after. If the device is already this
+# full once warmup -- ordinary eager execution, which CAN reclaim -- has settled, capture is not
+# attempted at all, and the config is reported as an ordinary, uncorrupting OOM instead.
+CAPTURE_MEM_GUARD_PCT = 99.0
+
+
+def _check_capture_headroom() -> None:
+    """Raise a clean OutOfMemoryError if capture is unsafe to attempt right now.
+
+    Deliberately the same exception type torch itself raises on a refused allocation: every
+    caller up the stack (cuda_monitor.is_oom, and every workload's except block) already treats
+    torch.cuda.OutOfMemoryError as a normal, recoverable OOM, so this needs no changes anywhere
+    else to be handled correctly."""
+    free, total = torch.cuda.mem_get_info()
+    used_pct = 100.0 * (total - free) / total if total else 0.0
+    if used_pct >= CAPTURE_MEM_GUARD_PCT:
+        raise torch.cuda.OutOfMemoryError(
+            f"skipping graph capture at {used_pct:.1f}% device memory used after warmup "
+            f"(guard is {CAPTURE_MEM_GUARD_PCT}%) -- see profiler.CAPTURE_MEM_GUARD_PCT")
+
 
 def _clear_capture_state() -> None:
     """Undo the RNG damage a failed capture leaves behind. Call after any capture that raised.
@@ -71,6 +103,7 @@ def _time_fn(fn, warmup: int, repeats: int, iters: int) -> float:
             fn()
     torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
+    _check_capture_headroom()
 
     # generate graph once, replay it later in timed window
     g = torch.cuda.CUDAGraph()
@@ -94,6 +127,7 @@ def _time_fn(fn, warmup: int, repeats: int, iters: int) -> float:
     if per_iter > 0 and per_iter * iters < MIN_GRAPH_MS:
         iters = min(MAX_ITERS, math.ceil(MIN_GRAPH_MS / per_iter))
         del g                       # release the old graph's private pool before recapturing
+        _check_capture_headroom()
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             for _ in range(iters):

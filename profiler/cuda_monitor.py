@@ -49,18 +49,37 @@ def progress_line(model: str, i: int, total: int, label: str, prev_start: float 
     return now
 
 
-def is_oom(exc: BaseException) -> bool:
-    """True if exc is a config running out of VRAM, by either of the two routes it arrives by.
+# A RuntimeError arriving with the device already reported at (or past) this fraction full is
+# treated as an OOM regardless of what it says -- see is_oom's third route below. Matches
+# dataset_cleanup.MEM_PRESSURE_PCT, the same reading used downstream to decide whether a
+# timing sits at the capacity boundary; kept as its own constant rather than imported because
+# that module pulls in pandas and is not meant to load into a live GPU worker.
+MEM_PRESSURE_OOM_PCT = 99.0
+
+
+def is_oom(exc: BaseException, max_memory_used_pct: float | None = None) -> bool:
+    """True if exc is a config running out of VRAM, by any of three routes it arrives by.
 
     torch raises OutOfMemoryError when its own allocator refuses -- which is what the
     per-process memory fraction triggers. But when the fraction sits close to the physical
     limit, the driver can get there first, and an allocation made during CUDA graph capture
     then comes back as a plain RuntimeError carrying cudaErrorMemoryAllocation. Same event,
     different exception type, and catching only the first left rows with no timing and oom
-    False -- indistinguishable from a code fault in the CSV."""
+    False -- indistinguishable from a code fault in the CSV.
+
+    The third route has no shared message at all: convnextv2_base logged both
+    "!handles_.at(i) INTERNAL ASSERT FAILED ... CUDACachingAllocator.cpp" (a cuDNN handle-pool
+    assert, a known downstream artefact of an allocator already at its cap) and "CUDA driver
+    error: device not ready" -- neither mentions memory -- with the monitor's own reading at
+    100.0% both times. A RuntimeError logged with the device already this full is treated as
+    OOM on that evidence rather than left as an unexplained train_failed. Callers that have not
+    read the monitor yet simply omit max_memory_used_pct and get the first two routes only."""
     if isinstance(exc, torch.cuda.OutOfMemoryError):
         return True
-    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+    if isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower():
+        return True
+    return (isinstance(exc, RuntimeError) and max_memory_used_pct is not None
+            and max_memory_used_pct >= MEM_PRESSURE_OOM_PCT)
 
 
 def build_row(hp, phase: str, metrics: dict | None = None,

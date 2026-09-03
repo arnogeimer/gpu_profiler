@@ -88,19 +88,19 @@ def run(hyperparams: Hyperparams) -> list[dict]:
         optimizer.step()
 
     monitor.start()
-    train_avg_ms, oom, err = None, False, ""
+    train_avg_ms, err, exc = None, "", None
     try:
         step()      # materialise gradients and the momentum buffer before the capture
         torch.cuda.synchronize()
         train_avg_ms = time_fn(step, *TRAIN_TIMING)
     except RuntimeError as e:
-        # is_oom covers both routes an out-of-VRAM config arrives by; see cuda_monitor.is_oom.
-        if is_oom(e):
-            oom = True   # recorded below rather than raised, so the sweep keeps going
-        else:
-            err = f"train_failed: {e}"
+        err, exc = f"train_failed: {e}", e   # provisional; reclassified below if it was OOM
     finally:
-        rows.append(build_row(hyperparams, "train", metrics=monitor.stop(oom=oom),
+        metrics = monitor.stop()
+        # is_oom covers all three routes an out-of-VRAM config arrives by; see cuda_monitor.is_oom.
+        if exc is not None and is_oom(exc, metrics.get("max_memory_used_pct")):
+            metrics["oom"], err = True, ""
+        rows.append(build_row(hyperparams, "train", metrics=metrics,
                               error=err, avg_ms=train_avg_ms, timing_method=TIMING_METHOD))
     torch.cuda.empty_cache()
 

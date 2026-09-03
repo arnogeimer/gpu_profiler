@@ -114,9 +114,12 @@ def run(hyperparams: Hyperparams) -> list[dict]:
                                   (hyperparams.batch_size, hyperparams.sequence_length),
                                   device=device)
     except Exception as e:
-        if not is_oom(e):
+        metrics = monitor.stop()
+        # is_oom covers all three routes an out-of-VRAM config arrives by; see cuda_monitor.is_oom.
+        if not is_oom(e, metrics.get("max_memory_used_pct")):
             raise
-        rows.append(build_row(hyperparams, "train", metrics=monitor.stop(oom=True),
+        metrics["oom"] = True
+        rows.append(build_row(hyperparams, "train", metrics=metrics,
                               timing_method=TIMING_METHOD))
         del model, base
         torch.cuda.empty_cache()
@@ -137,21 +140,19 @@ def run(hyperparams: Hyperparams) -> list[dict]:
 
     # No second monitor.start(): it was started before the move above, and starting again would
     # leave the first polling thread running alongside the second.
-    train_avg_ms, oom, err = None, False, ""
+    train_avg_ms, err, exc = None, "", None
     try:
         step()      # materialise gradients and AdamW's lazy state before the capture
         torch.cuda.synchronize()
         train_avg_ms = time_fn(step, *TRAIN_TIMING)
     except Exception as e:
-        # is_oom covers both routes an out-of-VRAM config arrives by; see cuda_monitor.is_oom.
-        # This workload was still catching only torch.cuda.OutOfMemoryError, so every OOM that
-        # came back as a driver-level RuntimeError was filed as train_failed instead.
-        if is_oom(e):
-            oom = True
-        else:
-            err = f"train_failed: {e}"
+        err, exc = f"train_failed: {e}", e   # provisional; reclassified below if it was OOM
     finally:
-        rows.append(build_row(hyperparams, "train", metrics=monitor.stop(oom=oom),
+        metrics = monitor.stop()
+        # is_oom covers all three routes an out-of-VRAM config arrives by; see cuda_monitor.is_oom.
+        if exc is not None and is_oom(exc, metrics.get("max_memory_used_pct")):
+            metrics["oom"], err = True, ""
+        rows.append(build_row(hyperparams, "train", metrics=metrics,
                               error=err, avg_ms=train_avg_ms, timing_method=TIMING_METHOD))
     torch.cuda.empty_cache()
 

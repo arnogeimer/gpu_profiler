@@ -145,20 +145,21 @@ def run(hyperparams: Hyperparams) -> list[dict]:
         optimizer.step()
 
     monitor.start()
-    train_avg_ms, kernels, oom, err = None, None, False, ""
+    train_avg_ms, kernels, err, exc = None, None, "", None
     try:
         train_avg_ms, kernels = kernel_time_fn(step, *TRAIN_TIMING)
     except Exception as e:
         # Broader than the other workloads on purpose: the set-prediction losses raise
         # ValueError (not RuntimeError) when a prediction goes non-finite, which would
-        # otherwise escape run() and lose the monitor metrics for this row. is_oom covers both
-        # routes an out-of-VRAM config arrives by; see cuda_monitor.is_oom.
-        if is_oom(e):
-            oom = True   # recorded below rather than raised, so the sweep keeps going
-        else:
-            err = f"train_failed: {type(e).__name__}: {e}"
+        # otherwise escape run() and lose the monitor metrics for this row.
+        err, exc = f"train_failed: {type(e).__name__}: {e}", e
     finally:
-        rows.append(build_row(hyperparams, "train", metrics=monitor.stop(oom=oom),
+        metrics = monitor.stop()
+        # is_oom covers all three routes an out-of-VRAM config arrives by (a plain ValueError
+        # never matches, memory pressure or not -- see cuda_monitor.is_oom).
+        if exc is not None and is_oom(exc, metrics.get("max_memory_used_pct")):
+            metrics["oom"], err = True, ""
+        rows.append(build_row(hyperparams, "train", metrics=metrics,
                               error=err, avg_ms=train_avg_ms,
                               timing_method=TIMING_METHOD, kernel_count=kernels))
     torch.cuda.empty_cache()
