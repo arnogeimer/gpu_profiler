@@ -33,7 +33,7 @@ import random
 import torch
 
 from .device_probe import (BWD_ITER_DIV, DIRECTIONS, DTYPES, SHAPE_SEED, _conv_point,
-                           _gemm_point, _iters_for, _rng, _logdraw, device_meta,
+                           _gemm_point, _iters_for, _point_result, _rng, _logdraw, device_meta,
                            _ClockSampler)
 from .profiler import time_fn
 
@@ -169,13 +169,9 @@ def probe_gemm_ext(rows: list, dt: torch.dtype, name: str) -> None:
         for d in DIRECTIONS:
             if _gemm_bytes(m, n, k, grad=(d == "fwd_bwd")) > MEM_BUDGET_BYTES:
                 continue                      # skipped identically on every card
-            try:
-                ms = _gemm_point(m, n, k, dt, d, warm, rep, _iters_for(d, iters))
-                rows.append({"probe": "gemm_ext", "dtype": name, "size": size,
-                             "direction": d, "ms": ms})
-            except torch.cuda.OutOfMemoryError:
-                rows.append({"probe": "gemm_ext", "dtype": name, "size": size,
-                             "direction": d, "oom": True})
+            rows.append(_point_result(
+                {"probe": "gemm_ext", "dtype": name, "size": size, "direction": d},
+                lambda m=m, n=n, k=k, d=d: _gemm_point(m, n, k, dt, d, warm, rep, _iters_for(d, iters))))
             torch.cuda.empty_cache()
 
 
@@ -187,13 +183,10 @@ def probe_conv1d(rows: list, dt: torch.dtype, name: str) -> None:
         for d in CONV_EXT_DIRECTIONS:
             if _conv1d_bytes(bs, cin, cout, length, k, stride) > MEM_BUDGET_BYTES:
                 continue
-            try:
-                ms = _conv1d_point(bs, cin, cout, length, k, stride, d, dt, warm, rep, iters)
-                rows.append({"probe": "conv1d", "dtype": name, "size": size,
-                             "direction": d, "ms": ms})
-            except torch.cuda.OutOfMemoryError:
-                rows.append({"probe": "conv1d", "dtype": name, "size": size,
-                             "direction": d, "oom": True})
+            rows.append(_point_result(
+                {"probe": "conv1d", "dtype": name, "size": size, "direction": d},
+                lambda bs=bs, cin=cin, cout=cout, length=length, k=k, stride=stride, d=d:
+                    _conv1d_point(bs, cin, cout, length, k, stride, d, dt, warm, rep, iters)))
             torch.cuda.empty_cache()
 
 
@@ -205,14 +198,10 @@ def probe_conv_ext(rows: list, dt: torch.dtype, name: str) -> None:
         for d in CONV_EXT_DIRECTIONS:
             if _conv2d_bytes(bs, cin, cout, hw, k, stride, pad, groups) > MEM_BUDGET_BYTES:
                 continue
-            try:
-                ms = _conv_point(bs, cin, cout, hw, k, stride, pad, groups, d, dt,
-                                 warm, rep, iters)
-                rows.append({"probe": "conv_ext", "dtype": name, "size": size,
-                             "direction": d, "ms": ms})
-            except torch.cuda.OutOfMemoryError:
-                rows.append({"probe": "conv_ext", "dtype": name, "size": size,
-                             "direction": d, "oom": True})
+            rows.append(_point_result(
+                {"probe": "conv_ext", "dtype": name, "size": size, "direction": d},
+                lambda bs=bs, cin=cin, cout=cout, hw=hw, k=k, stride=stride, pad=pad, groups=groups, d=d:
+                    _conv_point(bs, cin, cout, hw, k, stride, pad, groups, d, dt, warm, rep, iters)))
             torch.cuda.empty_cache()
 
 

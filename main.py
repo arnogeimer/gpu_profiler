@@ -444,9 +444,19 @@ def main() -> None:
             print(f"\n=== device_probe ===  {INSTANCE_ID} already probed; skipping.")
         else:
             print(f"\n=== device_probe ({INSTANCE_ID}) ===")
-            sig = device_probe.run_probe()
-            print(f"  {len(sig['probes'])} probe rows")
-            upload_bytes(json.dumps(sig, indent=2).encode("utf-8"), probe_path, token, repo_id)
+            # Every row already survives its own crash (see device_probe._point_result); this
+            # is the outer net for whatever is left -- device_meta() or the clock sampler dying
+            # outright on a card pushed hard enough to break the CUDA context entirely. There is
+            # no reference to screen against here anyway, so a probe that cannot even be
+            # attempted is not a reason to withhold the workload rows that ARE the point of this
+            # branch.
+            try:
+                sig = device_probe.run_probe()
+                print(f"  {len(sig['probes'])} probe rows")
+                upload_bytes(json.dumps(sig, indent=2).encode("utf-8"), probe_path, token, repo_id)
+            except Exception as e:
+                print(f"  device_probe failed: {type(e).__name__}: {e} — no v1 for this card, "
+                      f"continuing to v2 and workloads anyway.")
 
     # The allowlist is checked BEFORE probing, not after. INSTANCE_ID is the physical card's NVML
     # UUID, so a card that was one of the 228 the reference was built from is already known good
@@ -467,9 +477,17 @@ def main() -> None:
                 print("  stored probe could not be read — re-running it.")
         if sig is None:
             print(f"\n=== device_probe ({INSTANCE_ID}) ===")
-            sig = device_probe.run_probe()
-            print(f"  {len(sig['probes'])} probe rows")
-            upload_bytes(json.dumps(sig, indent=2).encode("utf-8"), probe_path, token, repo_id)
+            # A card this reference exists for IS meant to be screened, so a probe that cannot
+            # even be attempted must still stop it short of workloads -- same as failing the
+            # screen -- rather than crash the whole node and forfeit every checkpoint behind it.
+            try:
+                sig = device_probe.run_probe()
+                print(f"  {len(sig['probes'])} probe rows")
+                upload_bytes(json.dumps(sig, indent=2).encode("utf-8"), probe_path, token, repo_id)
+            except Exception as e:
+                print(f"  device_probe failed: {type(e).__name__}: {e} — cannot screen, "
+                      f"so not contributing.")
+                return
         if not screen_against_reference(sig, ref):
             print("exiting so the platform reallocates to a different node.")
             return

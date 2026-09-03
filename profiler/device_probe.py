@@ -355,6 +355,26 @@ def _rnn_point(bs: int, seq: int, inp: int, hidden: int, layers: int, bidir: boo
 
 # -------------------------------------------------------------------------------------------------------------------
 
+def _point_result(base: dict, fn) -> dict:
+    """Run one probe point; base plus a timing, or a failure recorded instead of raised.
+
+    A single row's exception must never end the sweep. OutOfMemoryError got its own catch
+    everywhere already, but that is not the only way a point can fail: a low-VRAM card pushed
+    hard enough can leave the CUDA context in a state where the NEXT op raises a plain
+    RuntimeError (a corrupted allocator, "device not ready") rather than OutOfMemoryError, and an
+    uncaught one of those crashes run_probe/run_extension outright -- losing every row still to
+    come, and on the RTX 2060 (6 GB) taking device_probe, the v2 extension and the workload loop
+    down with it since none of them run if this call never returns. OOM still gets its own
+    boolean, because "does not fit" is meaningful signal; anything else is recorded as text and
+    is not expected to fire in normal operation."""
+    try:
+        return {**base, "ms": fn()}
+    except torch.cuda.OutOfMemoryError:
+        return {**base, "oom": True}
+    except Exception as e:
+        return {**base, "error": f"{type(e).__name__}: {e}"}
+
+
 def probe_gemm(rows: list, dt: torch.dtype, name: str) -> None:
     """Matmul: an M ladder at each hidden (N, K), plus square anchors."""
     warm, rep, iters = GEMM_TIMING
@@ -363,18 +383,9 @@ def probe_gemm(rows: list, dt: torch.dtype, name: str) -> None:
     for m, n, k in shapes:
         size = f"m{m}n{n}k{k}"
         for d in DIRECTIONS:
-            try:
-                ms = _gemm_point(m, n, k, dt, d, warm, rep, _iters_for(d, iters))
-                rows.append({
-                    "probe": "gemm",
-                    "dtype": name,
-                    "size": size,
-                    "direction": d,
-                    "ms": ms,
-                })
-            except torch.cuda.OutOfMemoryError:
-                rows.append({"probe": "gemm", "dtype": name, "size": size,
-                             "direction": d, "oom": True})
+            rows.append(_point_result(
+                {"probe": "gemm", "dtype": name, "size": size, "direction": d},
+                lambda m=m, n=n, k=k, d=d: _gemm_point(m, n, k, dt, d, warm, rep, _iters_for(d, iters))))
             torch.cuda.empty_cache()
 
 
@@ -384,15 +395,10 @@ def probe_bmm(rows: list, dt: torch.dtype, name: str) -> None:
     for batch, m, n, k in BMM_SHAPES:
         size = f"b{batch}m{m}n{n}k{k}"
         for d in DIRECTIONS:
-            try:
-                ms = _bmm_point(batch, m, n, k, dt, d, warm, rep, _iters_for(d, iters))
-                rows.append({
-                    "probe": "bmm", "dtype": name, "size": size,
-                    "direction": d, "ms": ms,
-                })
-            except torch.cuda.OutOfMemoryError:
-                rows.append({"probe": "bmm", "dtype": name, "size": size,
-                             "direction": d, "oom": True})
+            rows.append(_point_result(
+                {"probe": "bmm", "dtype": name, "size": size, "direction": d},
+                lambda batch=batch, m=m, n=n, k=k, d=d:
+                    _bmm_point(batch, m, n, k, dt, d, warm, rep, _iters_for(d, iters))))
             torch.cuda.empty_cache()
 
 
@@ -402,16 +408,11 @@ def probe_conv(rows: list, dt: torch.dtype, name: str) -> None:
     for bs, cin, cout, hw, k, stride, pad, groups in CONV_SHAPES:
         for d in CONV_DIRECTIONS:
             size = f"{cin}x{cout}c{hw}k{k}s{stride}g{groups}"
-            try:
-                ms = _conv_point(bs, cin, cout, hw, k, stride, pad, groups, d,
-                                 dt, warm, rep, iters)
-                rows.append({
-                    "probe": "conv", "dtype": name, "size": size,
-                    "direction": d, "ms": ms,
-                })
-            except torch.cuda.OutOfMemoryError:
-                rows.append({"probe": "conv", "dtype": name, "size": size,
-                             "direction": d, "oom": True})
+            rows.append(_point_result(
+                {"probe": "conv", "dtype": name, "size": size, "direction": d},
+                lambda bs=bs, cin=cin, cout=cout, hw=hw, k=k, stride=stride, pad=pad,
+                       groups=groups, d=d:
+                    _conv_point(bs, cin, cout, hw, k, stride, pad, groups, d, dt, warm, rep, iters)))
             torch.cuda.empty_cache()
 
 
@@ -422,16 +423,13 @@ def probe_attn(rows: list, dt: torch.dtype, name: str) -> None:
         for causal in ((False, True) if seq_q == seq_kv else (False,)):
             size = f"q{seq_q}k{seq_kv}h{qh}/{kvh}d{head_dim}"
             for d in DIRECTIONS:
-                try:
-                    ms = _attn_point(bs, qh, kvh, seq_q, seq_kv, head_dim, causal,
-                                     dt, d, warm, rep, _iters_for(d, iters))
-                    rows.append({
-                        "probe": "attn", "dtype": name, "size": size,
-                        "causal": causal, "direction": d, "ms": ms,
-                    })
-                except torch.cuda.OutOfMemoryError:
-                    rows.append({"probe": "attn", "dtype": name, "size": size,
-                                 "causal": causal, "direction": d, "oom": True})
+                rows.append(_point_result(
+                    {"probe": "attn", "dtype": name, "size": size, "causal": causal,
+                     "direction": d},
+                    lambda bs=bs, qh=qh, kvh=kvh, seq_q=seq_q, seq_kv=seq_kv, head_dim=head_dim,
+                           causal=causal, d=d:
+                        _attn_point(bs, qh, kvh, seq_q, seq_kv, head_dim, causal, dt, d, warm,
+                                   rep, _iters_for(d, iters))))
                 torch.cuda.empty_cache()
 
 
@@ -441,15 +439,10 @@ def probe_elementwise(rows: list, dt: torch.dtype, name: str) -> None:
         warm, rep, iters = next((w, r, i) for cap, w, r, i in ELEMENTWISE_TIERS
                                 if numel <= cap)
         for d in DIRECTIONS:
-            try:
-                ms = _elementwise_point(numel, dt, d, warm, rep, _iters_for(d, iters))
-                rows.append({
-                    "probe": "elementwise", "dtype": name, "size": numel,
-                    "direction": d, "ms": ms,
-                })
-            except torch.cuda.OutOfMemoryError:
-                rows.append({"probe": "elementwise", "dtype": name, "size": numel,
-                             "direction": d, "oom": True})
+            rows.append(_point_result(
+                {"probe": "elementwise", "dtype": name, "size": numel, "direction": d},
+                lambda numel=numel, d=d:
+                    _elementwise_point(numel, dt, d, warm, rep, _iters_for(d, iters))))
             torch.cuda.empty_cache()
 
 
@@ -460,16 +453,11 @@ def probe_pool(rows: list, dt: torch.dtype, name: str) -> None:
         for kind in POOL_KINDS:
             size = f"{c}c{hw}k{k}s{stride}"
             for d in DIRECTIONS:
-                try:
-                    ms = _pool_point(bs, c, hw, k, stride, kind, dt, d,
-                                     warm, rep, _iters_for(d, iters))
-                    rows.append({
-                        "probe": "pool", "dtype": name, "size": size, "kind": kind,
-                        "direction": d, "ms": ms
-                    })
-                except torch.cuda.OutOfMemoryError:
-                    rows.append({"probe": "pool", "dtype": name, "size": size,
-                                 "kind": kind, "direction": d, "oom": True})
+                rows.append(_point_result(
+                    {"probe": "pool", "dtype": name, "size": size, "kind": kind, "direction": d},
+                    lambda bs=bs, c=c, hw=hw, k=k, stride=stride, kind=kind, d=d:
+                        _pool_point(bs, c, hw, k, stride, kind, dt, d, warm, rep,
+                                   _iters_for(d, iters))))
                 torch.cuda.empty_cache()
 
 
@@ -480,16 +468,12 @@ def probe_rnn(rows: list, dt: torch.dtype, name: str) -> None:
         for kind in RNN_KINDS:
             size = f"b{bs}s{seq}i{inp}h{hidden}l{layers}d{2 if bidir else 1}"
             for d in DIRECTIONS:
-                try:
-                    ms = _rnn_point(bs, seq, inp, hidden, layers, bidir, kind,
-                                    dt, d, warm, rep, _iters_for(d, iters))
-                    rows.append({
-                        "probe": "rnn", "dtype": name, "size": size, "kind": kind,
-                        "direction": d, "ms": ms
-                    })
-                except torch.cuda.OutOfMemoryError:
-                    rows.append({"probe": "rnn", "dtype": name, "size": size,
-                                 "kind": kind, "direction": d, "oom": True})
+                rows.append(_point_result(
+                    {"probe": "rnn", "dtype": name, "size": size, "kind": kind, "direction": d},
+                    lambda bs=bs, seq=seq, inp=inp, hidden=hidden, layers=layers, bidir=bidir,
+                           kind=kind, d=d:
+                        _rnn_point(bs, seq, inp, hidden, layers, bidir, kind, dt, d, warm, rep,
+                                  _iters_for(d, iters))))
                 torch.cuda.empty_cache()
 
 # -------------------------------------------------------------------------------------------------------------------
