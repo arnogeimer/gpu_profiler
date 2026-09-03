@@ -18,12 +18,51 @@ MIN_GRAPH_MS = 2.0
 MAX_ITERS = 200
 
 
+def _clear_capture_state() -> None:
+    """Undo the RNG damage a failed capture leaves behind. Call after any capture that raised.
+
+    A capture that raises part-way through leaves the CUDA RNG generator registered as
+    capture-bound, and nothing in the normal teardown clears it: every later RNG op in the
+    process -- dropout, randn, anything seeded -- then dies with "Offset increment outside graph
+    capture encountered unexpectedly", forever, on a context that is otherwise healthy.
+
+    It is a process-wide fault from a per-config failure, so it does not stay inside the workload
+    that caused it. That is how it was found: bloom-1b1 and Phi-3-mini fail capture on a host-side
+    copy (535 configs), and object_detection -- which runs last, and cannot even use capture --
+    lost 5 076 of 5 184 rows on all 16 cards to an error raised by a workload that had already
+    finished. Nothing distinguished it in the logs from a broken detection sweep.
+
+    Of everything tried, only completing one clean capture clears it: synchronize, empty_cache,
+    deleting the graph, manual_seed, and set_offset(0) all leave the generator poisoned. So the
+    repair is to capture something trivial and throw it away. Best-effort by design -- if the
+    context is genuinely dead this cannot help, and raising here would mask the original error."""
+    try:
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            torch.zeros(1, device="cuda").add_(1.0)
+        g.replay()
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+
+
 def time_fn(fn, warmup: int, repeats: int, iters: int) -> float:
     """Fastest per-iteration CUDA graph ms for function fn.
 
     iters is a floor: a cheap fn gets more iterations per capture so one graph launch is
     amortised over enough work (see MIN_GRAPH_MS). Callers whose step already runs for
-    milliseconds are unaffected."""
+    milliseconds are unaffected.
+
+    Any failure is repaired before it propagates, so a config that cannot be captured costs its
+    own row and nothing else -- see _clear_capture_state for what it would otherwise cost."""
+    try:
+        return _time_fn(fn, warmup, repeats, iters)
+    except Exception:
+        _clear_capture_state()
+        raise
+
+
+def _time_fn(fn, warmup: int, repeats: int, iters: int) -> float:
     # warmup on a side stream and waits for it to finish
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())

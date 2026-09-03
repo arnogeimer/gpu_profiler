@@ -20,8 +20,11 @@ READ, never written by a node:
 
   reference/{gpu_name}_reference_v1.json  -- the frozen health reference, built offline by
                                              build_ground_truth.py from a probe snapshot. A card
-                                             screens against this and nothing else; a model with
-                                             no reference file runs no workloads.
+                                             screens against this and nothing else. A model with
+                                             no reference file has too few cards for a screen to
+                                             mean anything, so it skips straight to workloads
+                                             unscreened rather than being locked out (see
+                                             "no reference published" in main()).
 
 ================================================================================================
 THE WORKLOAD CSV -- every column and where it comes from
@@ -102,6 +105,25 @@ import signal
 import statistics
 import sys
 import time
+
+# Set before torch is imported: the allocator reads this once, when it first initialises, and a
+# later assignment is silently ignored.
+#
+# The sweep has one failure mode this is aimed at. On an RTX 5090, every config of every model
+# from Qwen3-4B onward failed with ~31 GiB "reserved by PyTorch but unallocated" and only 616 MiB
+# actually in use -- the allocator had the memory and could not hand out a contiguous 1 GiB. It
+# is not gradual: audio classification shows no correlation at all between sweep position and
+# memory (Spearman -0.03), and same-size models later in the llm sweep use no more than earlier
+# ones. It is a cliff. Once a model large enough to exhaust the card is attempted, the segment
+# layout never recovers, and six models' worth of rows are lost to a card that could have run
+# them. expandable_segments lets a segment grow in place instead of being pinned at its original
+# size, which is the fragmentation this describes, and is what torch's own OOM message recommends.
+#
+# setdefault, so an operator can still pin a different allocator config from the environment.
+# Measured cost: none. Across eight llm configs the timings matched the default allocator to
+# within 0.4% (28.4 vs 28.5 ms, 128.9 vs 128.4 ms) -- it changes how segments are mapped, not
+# which kernels run.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import pandas as pd
 import torch
@@ -408,21 +430,29 @@ def main() -> None:
         return
 
     # --- screen: a card unlike its peers should not contribute to their shared dataframe -----
-    # A model with no frozen reference is one we never collected enough healthy probes for
-    # (pre-Ampere, or a single sighting). It gets no workloads rather than unscreened ones: an
-    # unscreened card is exactly what the reference exists to prevent, and running it would put
-    # timings of unknown provenance into a dataset whose whole purpose is the distribution.
+    # A model with no frozen reference is one build_ground_truth.py never had enough healthy
+    # probes to freeze one from (pre-Ampere, or so rarely rented that a peer comparison would be
+    # comparing this card to itself). There is no "not eligible" case any more: with too few
+    # instances to define a normal, the only unscreened population IS the population, so the
+    # card publishes its own v1 + v2 probes -- next in line to become the reference once enough
+    # exist -- and proceeds straight to workloads rather than being locked out indefinitely.
     ref = load_reference(gpu_name, repo_id, files)
     if ref is None:
-        print(f"\nno {REFERENCE_VERSION} reference published for {gpu_name} — "
-              "not eligible for workloads.")
-        return
+        print(f"\nno {REFERENCE_VERSION} reference published for {gpu_name} yet — too few cards "
+              "to screen against. Running unscreened: probe, then workloads regardless.")
+        if probe_path in files:
+            print(f"\n=== device_probe ===  {INSTANCE_ID} already probed; skipping.")
+        else:
+            print(f"\n=== device_probe ({INSTANCE_ID}) ===")
+            sig = device_probe.run_probe()
+            print(f"  {len(sig['probes'])} probe rows")
+            upload_bytes(json.dumps(sig, indent=2).encode("utf-8"), probe_path, token, repo_id)
 
     # The allowlist is checked BEFORE probing, not after. INSTANCE_ID is the physical card's NVML
     # UUID, so a card that was one of the 228 the reference was built from is already known good
     # and re-probing it would spend ten minutes to compare it against a median it helped define.
     # This is what the PROBE_ONLY pass bought: by the time workloads run, most cards are known.
-    if INSTANCE_ID in ref.get("healthy_uuids", []):
+    elif INSTANCE_ID in ref.get("healthy_uuids", []):
         print(f"\n=== screen ===  {INSTANCE_ID} is a known-healthy card in "
               f"{ref.get('version')}; skipping probe and screen.")
     else:

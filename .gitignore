@@ -16,6 +16,9 @@ Dockerfile
 
 # Generated outputs
 results/
+# Paper exports: ~170 MB reproduced from the hub by export_paper_data.py, so the script is the
+# artefact worth versioning, not its output.
+*_paper/
 **/NVIDIA_*_metrics.csv
 **/NVIDIA_*_smi.csv
 **/NVIDIA_*_smi/

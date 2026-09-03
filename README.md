@@ -153,6 +153,23 @@ Mitigation is post-hoc, since the row is only recognisable once its siblings
 exist. `dataset_cleanup.py` implements it in two stages; the module docstring
 carries the full derivation and the current numbers.
 
+**Stage 0 — escaped OOMs.** The one stage that adds information rather than
+removing it, and the only one repairing a *collection* bug rather than a
+measurement artefact. An OOM raised outside a workload's guarded region escapes
+`run()` and is caught by `run_all`'s blanket handler, which writes a
+`config_failed` row with the OOM buried in `error` as text and no `oom` flag.
+`llm_finetune` did this to **4 321 rows** — its `.to(device)` sat outside the
+guard, and a 3.8 B model in fp32 is ~15 GB of weights before a single activation,
+so the largest tier OOMs while *moving* rather than while stepping.
+
+Those rows are not failures. "It does not fit" is one of the more useful things
+this dataset records, and left as `config_failed` it reads as a broken run and is
+dropped by any consumer filtering on phase. Stage 1 missed them too, since it
+looks for `oom`. What cannot be restored is their memory readings — they never
+reached the monitor — but stage 1 needs only the flag, and stages 2 and 3 look
+only at timings. The workload code is fixed, so on a clean sweep this matches
+nothing.
+
 **Stage 1 — VRAM class.** If any card of a VRAM class OOM'd on a config, the
 config is marked OOM for every card of that class. Fitting is a property of the
 config and the capacity, so a lone survivor is a card that got lucky with
@@ -208,11 +225,38 @@ established that — were it degraded too the ratio would sit near 1 and nothing
 would fire. Noise is one-sided (minimum of repeats), so "fp16 was anomalously
 fast" is not an available explanation.
 
-**Together the two stages remove 68 of 23 282 timings (0.29%)** — 30 by VRAM
-class, 38 by precision ratio. They overlap usefully: with stage 1 applied first
-the audio bf16 arm flags nothing at all, because the case it was built for
-(RTX 4060 Ti, `wavlm-large` 16 s batch 4, bf16 at 4.58× its fp16 sibling) is one
-stage 1 already removes — its five classmates OOM'd on that config.
+**Stage 3 — slow outliers**, the only stage that needs no sibling of any kind.
+Stages 1 and 2 both compare a row to something measured under the same
+conditions, and both go blind when that thing failed the same way: a config
+degrading fp32, fp16 **and** bf16 equally leaves every precision ratio at ~1.0,
+and one degrading a whole VRAM class without OOMing any of it leaves stage 1 with
+no witness. `RTX 3080 Ti convnext_base 224/64 fp16` is 30× slow and invisible to
+both.
+
+So compare the row to the card itself. Its time ÷ the median across cards at that
+config is a quantity each card holds roughly constant everywhere — fleet-wide p50
+1.00, p90 1.17. Divide by the median of that over the card's own **unpressured**
+rows (a baseline built from all rows would absorb the degradation being looked
+for) and cut above 3×, against a healthy p99 of 1.46–1.55.
+
+**The stages remove 548 of 47 069 timings (1.16%) and repair 4 321 more** — a
+snapshot, since collection is ongoing; re-run the tool for current figures:
+
+| stage | image | audio | llm |
+|---|---:|---:|---:|
+| `oom_relabelled` *(repaired)* | 0 | 0 | 4 321 |
+| `vram_class_oom` | 6 | 122 | 139 |
+| `precision_artifact` | 59 | 52 | 1 |
+| `slow_outlier` | 71 | 91 | 6 |
+
+They overlap usefully: with stage 1 applied first the audio bf16 arm flags nothing
+at all, because the case it was built for (RTX 4060 Ti, `wavlm-large` 16 s batch 4)
+is one stage 1 already removes — its five classmates OOM'd on that config.
+
+Note what stage 3 finds is *not* an OOM in disguise. Of 157 outliers, **zero** had
+a same-class card OOM on that config, and 40–55% were not at ≥99% memory at all
+(`RTX 3060 sew-tiny 30 s/2` at 10.4× on 40% memory). So stage 3 removes the timing
+and leaves `oom` untouched.
 
 What none of it catches is a card uniformly slow at every precision; that is the
 device-probe screen's job. And the boundary is fuzzy: degradation is continuous,

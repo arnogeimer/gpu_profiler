@@ -128,6 +128,11 @@ WORKLOADS = ["image_classification", "audio_classification"]
 # and nothing downstream reasons at finer granularity than the marketing capacity.
 MIB_PER_GB = 1024
 
+# Stage 3. A row is cut when it is this many times slower than the card's own established
+# relationship to its peers. Healthy p99 after stages 1-2 is 1.66 / 2.34 / 1.46 across the three
+# workloads, so 3.0 is roughly twice the worst of them.
+EXCESS_THRESHOLD = 3.0
+
 # Ratios are (numerator precision / fp16), so >1 means the numerator is slower.
 ARMS = [("fp32", "fp16"), ("bf16", "fp16")]
 
@@ -255,6 +260,46 @@ def flag(table: pd.DataFrame) -> pd.DataFrame:
     return t
 
 
+def excess_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Each timing against what that card's own relationship to its peers predicts.
+
+    Stage 3, and the only stage that needs no sibling of any kind. Stages 1 and 2 both compare a
+    row to something measured under the same conditions -- another card of the same VRAM class,
+    or the same config at another precision -- and both go blind when the thing they compare
+    against fails the same way. A config that degrades fp32, fp16 and bf16 equally leaves every
+    precision ratio at ~1.0; a config that degrades a whole VRAM class without OOMing any of it
+    leaves stage 1 with no witness. RTX 3080 Ti convnext_base 224/64 fp16 is 30x slow and invisible
+    to both.
+
+    So this compares a row to the card itself. `ratio` is the row against the median across cards
+    at that config, which is a number the card should hold roughly constant everywhere -- a card
+    45% slower than the fleet median is 45% slower on nearly everything. `baseline` is the median
+    of that ratio over the card's own unpressured rows, and `excess` is how far this row departs
+    from it. Fleet-wide p50 is 1.00 and p90 is 1.17, so the quantity really is close to constant.
+
+    The baseline comes only from rows below MEM_PRESSURE_PCT. Built from all rows it would absorb
+    the very degradation being looked for, and on a card with many pressured rows -- the 12 GB
+    class runs 10-14% -- that shifts the baseline enough to hide the outliers behind it.
+
+    Indexed like the frame passed in. transform/map throughout rather than merge, because merge
+    returns a fresh RangeIndex and callers null rows by index -- with merge here clean() removed
+    63 rows where the report found 66, and not the same 63."""
+    axes = _axes(df) + ["precision"]
+    t = df[df.avg_time_ms.notna()].copy()
+    if t.empty:
+        return t.assign(ratio=np.nan, baseline=np.nan, excess=np.nan, n_peers=0)
+    g = t.groupby(axes, dropna=False)
+    t["n_peers"] = g.gpu.transform("nunique")
+    t["ratio"] = t.avg_time_ms / g.avg_time_ms.transform("median")
+
+    unpressured = t[t.max_memory_used_pct < MEM_PRESSURE_PCT]
+    t["baseline"] = t.gpu.map(unpressured.groupby("gpu")["ratio"].median())
+    # A card with no unpressured rows at all has no baseline and is left unjudged rather than
+    # given a fabricated one.
+    t["excess"] = (t.ratio / t.baseline).where(t.n_peers >= MIN_PEERS)
+    return t
+
+
 def flag_workload(workload: str) -> pd.DataFrame:
     """Stage 2 flagged groups for one workload, worst first."""
     t = flag(ratio_table(load(workload)))
@@ -263,20 +308,60 @@ def flag_workload(workload: str) -> pd.DataFrame:
     return t.sort_values("ratio", ascending=False)
 
 
-def clean(df: pd.DataFrame) -> pd.DataFrame:
-    """Both stages. Returns the frame with `cleanup` added and removed timings nulled.
+def relabel_escaped_ooms(df: pd.DataFrame) -> pd.DataFrame:
+    """Stage 0. Recover OOMs that were recorded as generic failures.
 
-    Stage order matters and is not a preference: stage 1 removes timings that stage 2 would
-    otherwise use as peers, and a peer baseline built from rows already known to be unusable is
-    worth less than one built without them.
+    The only stage that adds information rather than removing it, and the only one repairing a
+    collection bug rather than a measurement artifact. An OOM raised outside a workload's guarded
+    region escapes run() entirely and is caught by run_all's blanket handler, which writes a
+    `config_failed` row with the OOM buried in `error` as text and no `oom` flag. llm_finetune did
+    this to 4 321 rows: its .to(device) sat outside the guard, and a 3.8B model in fp32 is ~15 GB
+    of weights before a single activation, so the largest tier OOMs while moving rather than while
+    stepping.
 
-    Single pass on purpose. Feeding the output back in finds one further audio row, because each
-    removal shrinks a peer set and can move a median across a threshold. Iterating to a fixed
-    point would let the cut depth depend on how many rounds it happened to take rather than on
-    the data, so the rule is applied once, to the dataset as measured."""
+    Those rows are not failures. "It does not fit" is one of the more useful things this dataset
+    records, and left as `config_failed` it reads as a broken run and is dropped by any consumer
+    filtering on phase. Stage 1 misses them too -- it looks for `oom` -- so a config the whole
+    class OOM'd on looks unanimously healthy.
+
+    The workload code is fixed (see llm_finetune.run), so this only repairs rows already
+    collected; on a clean sweep it matches nothing. What it cannot restore is the memory readings,
+    since those rows never reached the monitor: they carry `oom` and no `max_memory_used_*`. That
+    is enough for stage 1, which only needs the flag, and irrelevant to stages 2 and 3, which look
+    only at timings.
+
+    Deliberately conservative: it requires an untimed row, an OOM message, and no existing flag.
+    A row that already carries `oom` is left alone, and one with a timing is never touched however
+    its error reads."""
+    out = df.copy()
+    err = out.error.fillna("").astype(str)
+    hit = (out.avg_time_ms.isna()
+           & err.str.contains("out of memory", case=False, regex=False)
+           & ~out.oom.fillna(False))
+    if not hit.any():
+        return out
+    # Normalised to whatever phase this workload's real measurements carry, so a repaired row is
+    # indistinguishable from one the fixed code would have written. Safe because no config in the
+    # collected data has rows under two phases -- checked across all 16 524 llm_finetune configs.
+    timed_phase = out.loc[out.avg_time_ms.notna(), "phase"].mode()
+    out.loc[hit, "oom"] = True
+    out.loc[hit, "error"] = ""
+    if len(timed_phase):
+        out.loc[hit, "phase"] = timed_phase.iloc[0]
+    out.loc[hit, "cleanup"] = "oom_relabelled"
+    return out
+
+
+def _stages_1_2(df: pd.DataFrame) -> pd.DataFrame:
+    """Stages 1 and 2 applied. Split out so clean() and the report share one definition of the
+    frame stage 3 sees -- reporting stage 3 against a differently-prepared frame counted 132
+    outliers where clean() removed 74."""
     axes = _axes(df)
-    out = stage1_vram_class(df)
+    # Stage 0 first: stage 1 counts OOM witnesses, and a witness still filed as config_failed is
+    # one it cannot see.
+    out = df.copy()
     out["cleanup"] = ""
+    out = stage1_vram_class(relabel_escaped_ooms(out))
 
     hit = out.class_oom & out.avg_time_ms.notna()
     out.loc[hit, ["avg_time_ms", "cleanup", "oom"]] = [np.nan, "vram_class_oom", True]
@@ -297,6 +382,25 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
                                       on=["gpu"] + axes + ["precision"])["index"]
         hit2 = out.index.isin(idx) & out.avg_time_ms.notna()
         out.loc[hit2, ["avg_time_ms", "cleanup"]] = [np.nan, "precision_artifact"]
+    return out
+
+
+def clean(df: pd.DataFrame) -> pd.DataFrame:
+    """All three stages. Returns the frame with `cleanup` added and removed timings nulled.
+
+    Stage order matters and is not a preference. Each stage's baselines are built from the rows
+    the earlier stages left standing, and a peer median or per-card baseline computed over rows
+    already known to be unusable is worth less than one computed without them.
+
+    Single pass on purpose. Feeding the output back in finds a further row or two, because each
+    removal shrinks a peer set and can move a median across a threshold. Iterating to a fixed
+    point would let the cut depth depend on how many rounds it happened to take rather than on
+    the data, so the rules are applied once, to the dataset as measured."""
+    out = _stages_1_2(df)
+    ex = excess_table(out)
+    hot = ex.index[ex.excess >= EXCESS_THRESHOLD]
+    hit3 = out.index.isin(hot) & out.avg_time_ms.notna()
+    out.loc[hit3, ["avg_time_ms", "cleanup"]] = [np.nan, "slow_outlier"]
     return out.drop(columns="class_oom")
 
 
@@ -308,8 +412,12 @@ def _report_stage1(workload: str, df: pd.DataFrame) -> None:
     axes = _axes(df)
     s = stage1_vram_class(df)
     cell = axes + ["precision", "vram_gb"]
+    # Counted the same way the stage itself counts, by the OOM flag rather than by a missing
+    # timing: a row can lack a timing for reasons that are not OOM (a capture failure, an errored
+    # setup), and calling those witnesses would report cells as mixed that the stage never touches.
+    s["_w"] = s.oom.fillna(False) & s.avg_time_ms.isna()
     g = s.groupby(cell, dropna=False).agg(
-        n_oom=("avg_time_ms", lambda v: v.isna().sum()), n_timed=("avg_time_ms", "count"))
+        n_oom=("_w", "sum"), n_timed=("avg_time_ms", "count"))
     mixed = g[(g.n_oom > 0) & (g.n_timed > 0)]
     removed = s[s.class_oom & s.avg_time_ms.notna()]
 
@@ -330,7 +438,18 @@ def _report(workload: str) -> pd.DataFrame:
     df = load(workload)
     axes = _axes(df)
     print(f"\n{'=' * 108}\n{workload}   {len(df):,} aggregated rows   axes: {', '.join(axes)}")
-    _report_stage1(workload, df)
+
+    r0 = relabel_escaped_ooms(df.assign(cleanup=""))
+    n0 = int((r0.cleanup == "oom_relabelled").sum())
+    print(f"\n  STAGE 0  escaped OOMs     {n0} rows recovered from config_failed"
+          + (f" ({n0 / len(df):.2%} of rows)" if n0 else " -- none, collection was clean"))
+    if n0:
+        top = r0[r0.cleanup == "oom_relabelled"].groupby("model").size().sort_values(ascending=False)
+        print(f"           worst models: " + ", ".join(f"{m.split('/')[-1]} {n}"
+                                                       for m, n in top.head(5).items()))
+    # Stage 1 reported on the relabelled frame, matching clean(): the rows stage 0 recovers are
+    # OOM witnesses, and reporting stage 1 without them understates its mixed cells.
+    _report_stage1(workload, r0)
 
     # Stage 2 is reported on the post-stage-1 frame, matching what clean() applies.
     staged = stage1_vram_class(df).copy()
@@ -362,11 +481,30 @@ def _report(workload: str) -> pd.DataFrame:
         print(f"\n           reason: {dict(bad.reason.value_counts())}")
         print(f"           rule:   {dict(bad.rule.value_counts())}")
 
+    ex = excess_table(_stages_1_2(df))
+    ok = ex[ex.excess < EXCESS_THRESHOLD].excess.dropna()
+    hot = ex[ex.excess >= EXCESS_THRESHOLD].sort_values("excess", ascending=False)
+    q = np.percentile(ok, [50, 90, 99]) if len(ok) else [np.nan] * 3
+    print(f"\n  STAGE 3  slow outliers   excess: med {q[0]:.2f}  p90 {q[1]:.2f}  p99 {q[2]:.2f}"
+          f"   -> {len(hot)} removed at >={EXCESS_THRESHOLD}x")
+    if len(hot):
+        print(f"      {'excess':>7} {'ms':>9} {'peers':>9}  {'mem':>6}  {'gpu':17} config")
+        for _, r in hot.head(12).iterrows():
+            cfg = " ".join(str(r[c]) for c in axes + ["precision"])
+            print(f"      {r.excess:6.1f}x {r.avg_time_ms:9.1f} {r.avg_time_ms / r.ratio:9.1f}  "
+                  f"{r.max_memory_used_pct:5.1f}%  {r.gpu.replace('NVIDIA_GeForce_', ''):17} {cfg[:52]}")
+        if len(hot) > 12:
+            print(f"      ... {len(hot) - 12} more")
+
     done = clean(df)
     n = done[done.cleanup != ""].cleanup.value_counts()
+    repaired = int(n.get("oom_relabelled", 0))       # stage 0 recovers rows, it does not remove
+    removed = {k: int(v) for k, v in n.items() if k != "oom_relabelled"}
     had, kept = df.avg_time_ms.notna().sum(), done.avg_time_ms.notna().sum()
     print(f"\n  TOTAL    {had - kept} timings removed of {had:,} "
-          f"({(had - kept) / max(had, 1):.2%}), {kept:,} kept   {dict(n)}")
+          f"({(had - kept) / max(had, 1):.2%}), {kept:,} kept   {removed}")
+    if repaired:
+        print(f"           plus {repaired} untimed rows relabelled as OOM (recovered, not removed)")
     out = done[done.cleanup != ""].copy()
     out["workload"] = workload
     return out

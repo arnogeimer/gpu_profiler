@@ -187,11 +187,36 @@ def _random_rnn_shapes() -> list:
     return out
 
 
+# Everything defined above is a shape the workloads actually dispatch -- resnet's stem, ViT's
+# patch embedding, attention's QK^T, the model hidden dims -- while everything appended below is
+# a random draw. Snapshot before the draws so the two can be told apart.
+_LITERAL = {"bmm": list(BMM_SHAPES), "conv": list(CONV_SHAPES),
+            "attn": list(ATTN_SHAPES), "rnn": list(RNN_SHAPES)}
+
 GEMM_RANDOM = _random_gemm_shapes()
 BMM_SHAPES += _random_bmm_shapes()
 CONV_SHAPES += _random_conv_shapes()
 ATTN_SHAPES += _random_attn_shapes()
 RNN_SHAPES += _random_rnn_shapes()
+
+# The traced shapes are pinned into every reference: they are lighter than the random draws --
+# conv's are 0.09 GFLOP at the median against the grid's 2.25 -- so the heaviest-25% cut drops
+# all nine of conv's and 38 literal shapes overall, leaving the probe to describe the hardware
+# on shapes no model runs. See _heaviest.
+PINNED_SIZES = (
+    {("gemm", f"m{m}n{n}k{k}") for n, k in GEMM_HIDDEN for m in GEMM_M}
+    | {("gemm", f"m{s}n{s}k{s}") for s in GEMM_SQUARE}
+    | {("bmm", f"b{b}m{m}n{n}k{k}") for b, m, n, k in _LITERAL["bmm"]}
+    | {("conv", f"{cin}x{cout}c{hw}k{k}s{st}g{gr}")
+       for _bs, cin, cout, hw, k, st, _pad, gr in _LITERAL["conv"]}
+    | {("attn", f"q{sq}k{sk}h{qh}/{kvh}d{hd}")
+       for _bs, qh, kvh, sq, sk, hd in _LITERAL["attn"]}
+    | {("rnn", f"b{bs}s{seq}i{inp}h{hid}l{lay}d{2 if bd else 1}")
+       for bs, seq, inp, hid, lay, bd in _LITERAL["rnn"]}
+    | {("elementwise", n) for n in ELEMENTWISE_NUMEL}
+    | {("pool", f"{c}c{hw}k{k}s{st}") for _bs, c, hw, k, st in POOL_SHAPES}
+)
+
 
 # -------------------------------------------------------------------------------------------------------------------
 
@@ -732,20 +757,156 @@ if __name__ == "__main__":
 HEAVY_FRACTION = 0.25
 
 
+# FLOPs per probe row, derived from the shape constants above rather than from any measurement.
+#
+# `_heaviest` used to rank rows by their reference TIME, which made the selection a property of
+# the card: each GPU model kept whichever rows IT happened to be slow on, so the 23 references
+# shared only 647 of 953 rows and a verdict on a 4090 was computed over a different basis than a
+# verdict on a 3070. Work is a property of the shape, not of the machine, so it is computed here
+# and the same rows are heaviest everywhere.
+#
+# The size string is not enough on its own -- conv, attn and pool omit the batch size from it --
+# so the table is built by walking the same constants the probes walk, producing the same size
+# strings. Two attn shapes collide on their string (differing only in batch); last-wins matches
+# what _probe_rows does when it folds them into one key.
+#
+# For gemm/bmm/conv/attn/rnn this is genuine FLOPs. elementwise and pool are memory- and
+# comparison-bound, with no meaningful FLOP count -- they get element counts instead. That is
+# sound because ranking is always WITHIN a family: the number only has to order shapes against
+# others of its own kind, never against another family's.
+_RNN_GATES = {"lstm": 4, "gru": 3, "rnn": 1}
+
+
+def _conv_out(hw: int, k: int, stride: int, pad: int) -> int:
+    return (hw + 2 * pad - k) // stride + 1
+
+
+def _shape_work() -> dict:
+    """{(probe, size, kind): forward work} for every shape the probes emit."""
+    w = {}
+    for n, k in GEMM_HIDDEN:
+        for m in GEMM_M:
+            w[("gemm", f"m{m}n{n}k{k}", None)] = 2 * m * n * k
+    for sq in GEMM_SQUARE:
+        w[("gemm", f"m{sq}n{sq}k{sq}", None)] = 2 * sq ** 3
+    for m, n, k in GEMM_RANDOM:
+        w[("gemm", f"m{m}n{n}k{k}", None)] = 2 * m * n * k
+    for b, m, n, k in BMM_SHAPES:
+        w[("bmm", f"b{b}m{m}n{n}k{k}", None)] = 2 * b * m * n * k
+    for bs, cin, cout, hw, k, stride, pad, groups in CONV_SHAPES:
+        out = _conv_out(hw, k, stride, pad)
+        w[("conv", f"{cin}x{cout}c{hw}k{k}s{stride}g{groups}", None)] = (
+            2 * bs * cout * out * out * (cin // max(groups, 1)) * k * k)
+    for bs, qh, kvh, sq, sk, hd in ATTN_SHAPES:
+        # QK^T then AV, each 2*bs*qh*sq*sk*hd
+        w[("attn", f"q{sq}k{sk}h{qh}/{kvh}d{hd}", None)] = 4 * bs * qh * sq * sk * hd
+    for numel in ELEMENTWISE_NUMEL:
+        w[("elementwise", numel, None)] = numel
+    for bs, c, hw, k, stride in POOL_SHAPES:
+        out = _conv_out(hw, k, stride, 0)
+        for kind in POOL_KINDS:
+            w[("pool", f"{c}c{hw}k{k}s{stride}", kind)] = bs * c * out * out * k * k
+    for bs, seq, inp, hidden, layers, bidir in RNN_SHAPES:
+        dirs = 2 if bidir else 1
+        size = f"b{bs}s{seq}i{inp}h{hidden}l{layers}d{dirs}"
+        for kind, gates in _RNN_GATES.items():
+            total = 0
+            for layer in range(layers):
+                in_dim = inp if layer == 0 else hidden * dirs
+                total += 2 * bs * seq * dirs * gates * hidden * (in_dim + hidden)
+            w[("rnn", size, kind)] = total
+    return w
+
+
+def _shape_work_v2() -> dict:
+    """The same, for the v2 extension's grid (probe_extension).
+
+    Imported lazily and tolerantly: device_probe is what a node runs first, and it must not fail
+    to import because the extension module is unavailable or has moved on."""
+    try:
+        from profiler import probe_extension as pe
+    except Exception:                                             # pragma: no cover
+        return {}
+    w = {}
+    shapes = [(m, n, k) for n, k in pe.GEMM_EXT_HIDDEN for m in pe.GEMM_EXT_M]
+    shapes += list(getattr(pe, "GEMM_EXT_RANDOM", []))
+    for m, n, k in shapes:
+        w[("gemm_ext", f"m{m}n{n}k{k}", None)] = 2 * m * n * k
+    for bs, cin, cout, length, k, stride in pe.CONV1D_SHAPES:
+        out = (length - k) // stride + 1
+        w[("conv1d", f"b{bs}c{cin}o{cout}l{length}k{k}s{stride}", None)] = (
+            2 * bs * cout * out * cin * k)
+    for bs, cin, cout, hw, k, stride, pad, groups in pe.CONV2D_EXT_SHAPES:
+        out = _conv_out(hw, k, stride, pad)
+        w[("conv_ext", f"b{bs}c{cin}o{cout}hw{hw}k{k}s{stride}p{pad}g{groups}", None)] = (
+            2 * bs * cout * out * out * (cin // max(groups, 1)) * k * k)
+    return w
+
+
+_WORK = _shape_work()
+_V2_LOADED = False
+
+
+def _ensure_v2() -> None:
+    """Fold the v2 grid in on first use, never at import.
+
+    probe_extension imports this module, so building the v2 table at import time is a circular
+    import: whichever of the two is imported first sees the other half-initialised."""
+    global _V2_LOADED
+    if not _V2_LOADED:
+        _V2_LOADED = True
+        _WORK.update(_shape_work_v2())
+
+# A backward pass costs roughly two more of the forward's matmuls (dgrad + wgrad), so fwd_bwd is
+# 3x. conv's three directions are each about one forward's worth of work, so they tie -- which is
+# correct, and leaves dtype and shape to order them.
+_DIRECTION_SCALE = {"fwd": 1.0, "fwd_bwd": 3.0, "fprop": 1.0, "dgrad": 1.0, "wgrad": 1.0}
+
+
+def row_flops(key: tuple) -> float:
+    """Forward-equivalent work for a probe row key (probe, dtype, size, direction, kind, causal).
+
+    0.0 for a key with no known shape, which sorts it last rather than raising -- a reference
+    built against an older probe grid should degrade, not crash."""
+    probe, _dtype, size, direction, kind, causal = key
+    if probe not in ("gemm", "bmm", "conv", "attn", "elementwise", "pool", "rnn"):
+        _ensure_v2()
+    base = _WORK.get((probe, size, kind if probe in ("rnn", "pool") else None))
+    if base is None:
+        return 0.0
+    work = base * _DIRECTION_SCALE.get(direction, 1.0)
+    if causal:                      # a causal mask halves the attention matrix
+        work *= 0.5
+    return work
+
+
 def _heaviest(cost: dict, fraction: float) -> list:
-    """The `fraction` largest rows within each kernel family, ranked by reference time.
+    """The `fraction` largest rows within each kernel family, ranked by FLOPs.
 
     Per family, not pooled: a global top-25% would be almost entirely rnn and attn, and would
     drop elementwise completely -- which is the family that separates cards by memory bandwidth
-    and the one where a 3090 beats a 4080 SUPER."""
+    and the one where a 3090 beats a 4080 SUPER.
+
+    Ranked by the work the shape implies, NOT by how long any card took. `cost` is accepted for
+    its keys alone; its values are ignored. Ties break on the key so the choice is deterministic
+    and identical on every machine.
+
+    Rows in PINNED_SIZES bypass the ranking entirely and are always kept. They are the shapes the
+    workloads actually dispatch, which are far lighter than the random grid -- keeping only the
+    heaviest quarter would describe the hardware on shapes no model runs.
+    """
     if fraction >= 1.0:
         return list(cost)
     by_family: dict = {}
+    pinned = []
     for k in cost:
-        by_family.setdefault(k[0], []).append(k)
-    out = []
+        if (k[0], k[2]) in PINNED_SIZES:
+            pinned.append(k)
+        else:
+            by_family.setdefault(k[0], []).append(k)
+    out = list(pinned)
     for ks in by_family.values():
-        ks.sort(key=lambda k: -cost[k])
+        ks.sort(key=lambda k: (-row_flops(k), tuple("" if x is None else str(x) for x in k)))
         out += ks[:max(1, int(len(ks) * fraction))]
     return out
 

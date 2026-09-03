@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from profiler.cuda_monitor import CUDAMonitor, build_row, progress_line
+from profiler.cuda_monitor import CUDAMonitor, build_row, is_oom, progress_line
 from profiler.profiler import time_fn
 
 import transformers
@@ -88,19 +88,40 @@ def run(hyperparams: Hyperparams) -> list[dict]:
                               timing_method=TIMING_METHOD))
         return rows
 
-    model = model.to(device).train()
-    vocab_size = model.config.vocab_size
+    # Guarded, unlike the other workloads: this is the only one whose weights alone can exceed
+    # the card. A 3.8B model in fp32 is ~15 GB before a single activation, so .to(device) is
+    # where the largest tier OOMs -- and an OOM here used to escape run() entirely and be
+    # recorded by run_all as `config_failed` with the OOM text buried in `error`. That mislabelled
+    # 4 046 rows as failures when they are the expected, informative answer: it does not fit.
+    #
+    # The monitor starts before the move rather than before the step, so a config that dies here
+    # still reports the memory it reached. Everything downstream reads peak memory to decide
+    # whether an OOM sits at the capacity boundary, and a row with no memory at all cannot be
+    # placed.
+    monitor.start()
+    try:
+        model = model.to(device).train()
+        vocab_size = model.config.vocab_size
 
-    # Optimizer only sees the (tiny) LoRA adapter params. capturable=True keeps AdamW's step
-    # counter on-device; the default reads a CPU scalar, which fails under graph capture.
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=1e-4,
-        capturable=True,
-    )
+        # Optimizer only sees the (tiny) LoRA adapter params. capturable=True keeps AdamW's step
+        # counter on-device; the default reads a CPU scalar, which fails under graph capture.
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=1e-4,
+            capturable=True,
+        )
+        train_ids = torch.randint(0, vocab_size,
+                                  (hyperparams.batch_size, hyperparams.sequence_length),
+                                  device=device)
+    except Exception as e:
+        if not is_oom(e):
+            raise
+        rows.append(build_row(hyperparams, "train", metrics=monitor.stop(oom=True),
+                              timing_method=TIMING_METHOD))
+        del model, base
+        torch.cuda.empty_cache()
+        return rows
     amp_dtype = AMP_DTYPES.get(hyperparams.precision)
-
-    train_ids = torch.randint(0, vocab_size, (hyperparams.batch_size, hyperparams.sequence_length), device=device)
 
     def step():
         # set_to_none=False keeps the gradient buffers at fixed addresses across replays; the
@@ -114,16 +135,21 @@ def run(hyperparams: Hyperparams) -> list[dict]:
         loss.backward()
         optimizer.step()
 
-    monitor.start()
+    # No second monitor.start(): it was started before the move above, and starting again would
+    # leave the first polling thread running alongside the second.
     train_avg_ms, oom, err = None, False, ""
     try:
         step()      # materialise gradients and AdamW's lazy state before the capture
         torch.cuda.synchronize()
         train_avg_ms = time_fn(step, *TRAIN_TIMING)
-    except torch.cuda.OutOfMemoryError:
-        oom = True   # record below, then continue to inference
-    except RuntimeError as e:
-        err = f"train_failed: {e}"
+    except Exception as e:
+        # is_oom covers both routes an out-of-VRAM config arrives by; see cuda_monitor.is_oom.
+        # This workload was still catching only torch.cuda.OutOfMemoryError, so every OOM that
+        # came back as a driver-level RuntimeError was filed as train_failed instead.
+        if is_oom(e):
+            oom = True
+        else:
+            err = f"train_failed: {e}"
     finally:
         rows.append(build_row(hyperparams, "train", metrics=monitor.stop(oom=oom),
                               error=err, avg_ms=train_avg_ms, timing_method=TIMING_METHOD))
@@ -133,6 +159,21 @@ def run(hyperparams: Hyperparams) -> list[dict]:
     return rows
 
 
+# bloom-1b1, Phi-3-mini-4k-instruct and Phi-3.5-mini-instruct are absent on purpose. All three
+# build a host tensor inside their forward -- BLOOM its alibi slopes, the Phi-3 pair their rotary
+# inverse frequencies -- so CUDA graph capture rejects the copy exactly as it did for WavLM and
+# SEW-D in audio_classification. Across 17 cards and 36 configs each they produced 1 836 rows and
+# not one timing: every config that had memory to run at all failed to capture, and the rest OOM'd.
+#
+# Phi-3.5 was checked alone in a fresh process rather than assumed guilty by association: it fails
+# on its own, so this is architectural and not fallout from Phi-3-mini running before it. Nothing
+# is recoverable by re-running them, and patching two families for zero rows is not worth the
+# measurement caveat a patch carries (see the WavLM note in audio_classification for what that
+# costs). Their absence is why tier 2 holds 9 and tier 3 holds 4.
+#
+# They were not free to keep. Each burned a slot's worth of capture attempts per card, and the
+# Phi-3 failures poisoned the CUDA RNG generator process-wide, which cost object_detection every
+# row it ever collected -- see profiler._clear_capture_state, which now contains that damage.
 MODELS = [
     # tier 1 (≤500M). gpt2/distilgpt2 are the only non-RoPE entries: learned absolute position
     # embeddings, LayerNorm and Conv1D projections instead of RoPE/RMSNorm/nn.Linear, so they
@@ -146,7 +187,6 @@ MODELS = [
     # tier 2 (~1-1.7B)
     'EleutherAI/pythia-1b',
     'TinyLlama/TinyLlama-1.1B-Chat-v1.0',
-    'bigscience/bloom-1b1',
     'microsoft/phi-1_5',
     'EleutherAI/pythia-1.4b',
     'Qwen/Qwen2.5-1.5B',
@@ -158,8 +198,6 @@ MODELS = [
     'EleutherAI/pythia-2.8b',
     'microsoft/phi-2',
     'Qwen/Qwen2.5-3B',
-    'microsoft/Phi-3-mini-4k-instruct',
-    'microsoft/Phi-3.5-mini-instruct',
     'Qwen/Qwen3-4B',
     # tier 4 (~7B)
     'HuggingFaceH4/zephyr-7b-beta',
