@@ -102,7 +102,10 @@ def run(hyperparams: Hyperparams) -> list[dict]:
             metrics["oom"], err = True, ""
         rows.append(build_row(hyperparams, "train", metrics=metrics,
                               error=err, avg_ms=train_avg_ms, timing_method=TIMING_METHOD))
-    torch.cuda.empty_cache()
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass    # already-recorded row above must not be lost to a second, unrelated failure
 
     del model, optimizer, x, y
     return rows
@@ -172,7 +175,13 @@ def run_all(only_models: Optional[set] = None, skip_models: Optional[set] = None
                 print(f"FAIL ({type(e).__name__}): {params} - {e}")
                 all_rows.append({**params, "phase": "config_failed", "error": f"{type(e).__name__}: {e}"})
             finally:
-                torch.cuda.empty_cache()
+                # A broken context here would otherwise escape this finally clause and take
+                # every remaining model in this workload down with it -- and main.py has no
+                # guard around run_all() at all, so the whole rest of the node's sweep too.
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
         if checkpoint_fn is not None and i % CHECKPOINT_EVERY == 0:
             try:

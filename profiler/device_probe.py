@@ -359,20 +359,32 @@ def _point_result(base: dict, fn) -> dict:
     """Run one probe point; base plus a timing, or a failure recorded instead of raised.
 
     A single row's exception must never end the sweep. OutOfMemoryError got its own catch
-    everywhere already, but that is not the only way a point can fail: a low-VRAM card pushed
-    hard enough can leave the CUDA context in a state where the NEXT op raises a plain
-    RuntimeError (a corrupted allocator, "device not ready") rather than OutOfMemoryError, and an
-    uncaught one of those crashes run_probe/run_extension outright -- losing every row still to
-    come, and on the RTX 2060 (6 GB) taking device_probe, the v2 extension and the workload loop
-    down with it since none of them run if this call never returns. OOM still gets its own
-    boolean, because "does not fit" is meaningful signal; anything else is recorded as text and
-    is not expected to fire in normal operation."""
+    everywhere already, but that is not the only way a point can fail: a card pushed hard enough
+    can leave the CUDA context in a state where the NEXT op raises a plain RuntimeError (a
+    corrupted allocator, "device not ready", "an illegal memory access was encountered") rather
+    than OutOfMemoryError, and an uncaught one of those crashes run_probe/run_extension outright.
+    OOM still gets its own boolean, because "does not fit" is meaningful signal; anything else is
+    recorded as text and is not expected to fire in normal operation.
+
+    empty_cache() is called here rather than by each caller, and inside its own try -- not as
+    tidiness, but because it is itself a CUDA call. On an RTX 2070/2080 Ti it was observed sitting
+    right after this function returns in every probe_* loop, unguarded, and once a point's own
+    context-corrupting failure had already been caught and recorded above, THIS call raised the
+    same corruption straight past every remaining row and out of run_probe() entirely -- so the
+    per-row catch above was doing its job and losing the credit for it one line later. A device
+    already this broken cannot be helped by emptying its cache anyway, so the failure is
+    swallowed rather than left to escape a second time."""
     try:
-        return {**base, "ms": fn()}
+        out = {**base, "ms": fn()}
     except torch.cuda.OutOfMemoryError:
-        return {**base, "oom": True}
+        out = {**base, "oom": True}
     except Exception as e:
-        return {**base, "error": f"{type(e).__name__}: {e}"}
+        out = {**base, "error": f"{type(e).__name__}: {e}"}
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    return out
 
 
 def probe_gemm(rows: list, dt: torch.dtype, name: str) -> None:
@@ -386,7 +398,6 @@ def probe_gemm(rows: list, dt: torch.dtype, name: str) -> None:
             rows.append(_point_result(
                 {"probe": "gemm", "dtype": name, "size": size, "direction": d},
                 lambda m=m, n=n, k=k, d=d: _gemm_point(m, n, k, dt, d, warm, rep, _iters_for(d, iters))))
-            torch.cuda.empty_cache()
 
 
 def probe_bmm(rows: list, dt: torch.dtype, name: str) -> None:
@@ -399,7 +410,6 @@ def probe_bmm(rows: list, dt: torch.dtype, name: str) -> None:
                 {"probe": "bmm", "dtype": name, "size": size, "direction": d},
                 lambda batch=batch, m=m, n=n, k=k, d=d:
                     _bmm_point(batch, m, n, k, dt, d, warm, rep, _iters_for(d, iters))))
-            torch.cuda.empty_cache()
 
 
 def probe_conv(rows: list, dt: torch.dtype, name: str) -> None:
@@ -413,7 +423,6 @@ def probe_conv(rows: list, dt: torch.dtype, name: str) -> None:
                 lambda bs=bs, cin=cin, cout=cout, hw=hw, k=k, stride=stride, pad=pad,
                        groups=groups, d=d:
                     _conv_point(bs, cin, cout, hw, k, stride, pad, groups, d, dt, warm, rep, iters)))
-            torch.cuda.empty_cache()
 
 
 def probe_attn(rows: list, dt: torch.dtype, name: str) -> None:
@@ -430,7 +439,6 @@ def probe_attn(rows: list, dt: torch.dtype, name: str) -> None:
                            causal=causal, d=d:
                         _attn_point(bs, qh, kvh, seq_q, seq_kv, head_dim, causal, dt, d, warm,
                                    rep, _iters_for(d, iters))))
-                torch.cuda.empty_cache()
 
 
 def probe_elementwise(rows: list, dt: torch.dtype, name: str) -> None:
@@ -443,7 +451,6 @@ def probe_elementwise(rows: list, dt: torch.dtype, name: str) -> None:
                 {"probe": "elementwise", "dtype": name, "size": numel, "direction": d},
                 lambda numel=numel, d=d:
                     _elementwise_point(numel, dt, d, warm, rep, _iters_for(d, iters))))
-            torch.cuda.empty_cache()
 
 
 def probe_pool(rows: list, dt: torch.dtype, name: str) -> None:
@@ -458,7 +465,6 @@ def probe_pool(rows: list, dt: torch.dtype, name: str) -> None:
                     lambda bs=bs, c=c, hw=hw, k=k, stride=stride, kind=kind, d=d:
                         _pool_point(bs, c, hw, k, stride, kind, dt, d, warm, rep,
                                    _iters_for(d, iters))))
-                torch.cuda.empty_cache()
 
 
 def probe_rnn(rows: list, dt: torch.dtype, name: str) -> None:
@@ -474,7 +480,6 @@ def probe_rnn(rows: list, dt: torch.dtype, name: str) -> None:
                            kind=kind, d=d:
                         _rnn_point(bs, seq, inp, hidden, layers, bidir, kind, dt, d, warm, rep,
                                   _iters_for(d, iters))))
-                torch.cuda.empty_cache()
 
 # -------------------------------------------------------------------------------------------------------------------
 

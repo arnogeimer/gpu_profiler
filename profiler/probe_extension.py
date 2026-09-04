@@ -172,7 +172,6 @@ def probe_gemm_ext(rows: list, dt: torch.dtype, name: str) -> None:
             rows.append(_point_result(
                 {"probe": "gemm_ext", "dtype": name, "size": size, "direction": d},
                 lambda m=m, n=n, k=k, d=d: _gemm_point(m, n, k, dt, d, warm, rep, _iters_for(d, iters))))
-            torch.cuda.empty_cache()
 
 
 def probe_conv1d(rows: list, dt: torch.dtype, name: str) -> None:
@@ -187,7 +186,6 @@ def probe_conv1d(rows: list, dt: torch.dtype, name: str) -> None:
                 {"probe": "conv1d", "dtype": name, "size": size, "direction": d},
                 lambda bs=bs, cin=cin, cout=cout, length=length, k=k, stride=stride, d=d:
                     _conv1d_point(bs, cin, cout, length, k, stride, d, dt, warm, rep, iters)))
-            torch.cuda.empty_cache()
 
 
 def probe_conv_ext(rows: list, dt: torch.dtype, name: str) -> None:
@@ -202,7 +200,6 @@ def probe_conv_ext(rows: list, dt: torch.dtype, name: str) -> None:
                 {"probe": "conv_ext", "dtype": name, "size": size, "direction": d},
                 lambda bs=bs, cin=cin, cout=cout, hw=hw, k=k, stride=stride, pad=pad, groups=groups, d=d:
                     _conv_point(bs, cin, cout, hw, k, stride, pad, groups, d, dt, warm, rep, iters)))
-            torch.cuda.empty_cache()
 
 
 def run_extension(dtypes: dict | None = None) -> dict:
