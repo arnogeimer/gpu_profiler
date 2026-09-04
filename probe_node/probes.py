@@ -1199,6 +1199,12 @@ class _ClockSampler:
         if not self._sm:
             return viol
         busy = [c for c in self._sm if c > 0]
+        if not busy:
+            # Sampled, but the card never reported a non-zero SM clock -- idle, or dead. Both
+            # median() and max() raise on an empty sequence, and this runs inside run_probes'
+            # finally where an exception would discard the entire sweep. Zero is also the honest
+            # answer: the card never left 0 MHz.
+            busy = [0]
         return {
             "achieved_sm_clock_mhz_median": statistics.median(busy),
             "achieved_sm_clock_mhz_max": max(busy),
@@ -1245,9 +1251,26 @@ def run_probes(dtypes: dict | None = None, families: tuple | None = None) -> dic
                     print(f"  {family.__name__} [{name}] ended early -- "
                           f"{type(e).__name__}: {e}", flush=True)
     finally:
-        clocks = sampler.stop()
+        # Both of these read METADATA, after a sweep that may have left the context broken -- and
+        # metadata is worth less than the rows it would otherwise take down with it. An exception
+        # from either used to propagate out of run_probes, and the caller catches that and gets
+        # nothing back: a node observed to sweep for ten minutes, break its context somewhere in
+        # the middle, then throw away all 1369 rows on the way out and publish nothing at all.
+        # sampler.stop() is the worse of the two because it sits in a finally, where an exception
+        # also replaces whatever was already in flight.
+        try:
+            clocks = sampler.stop()
+        except Exception as e:
+            clocks = {"clock_sampler_error": f"{type(e).__name__}: {e}"}
 
-    return {"device": {**device_meta(), **clocks}, "probes": rows}
+    try:
+        device = device_meta()
+    except Exception as e:
+        device = {"device_meta_error": f"{type(e).__name__}: {e}"}
+        print(f"  device_meta failed: {type(e).__name__}: {e} -- keeping the rows anyway",
+              flush=True)
+
+    return {"device": {**device, **clocks}, "probes": rows}
 
 
 def main() -> None:

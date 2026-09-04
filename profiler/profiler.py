@@ -1,10 +1,23 @@
 import math
+import warnings
 
 import torch
 
 from torch._C._autograd import DeviceType   # torch.autograd re-exports it but does not declare it
 from torch.profiler import ProfilerActivity, profile
 
+
+# An empty capture is a silent fabrication, so it is escalated to an exception rather than left
+# as the warning torch emits. torch replays an empty graph as a no-op: elapsed_time comes back at
+# ~0, and _time_fn would return that as a real, very fast measurement rather than the failure it
+# is. Seen on a node whose CUDA context had already gone bad -- from that point every capture was
+# empty, and every row after it would have carried a fabricated ~0 ms.
+#
+# As an exception it travels the path every other capture failure already takes: time_fn repairs
+# what it can, and the caller records the row as an error. Scoped to this one message so nothing
+# else changes, and it fails open -- if torch ever rewords the warning the filter stops matching
+# and behaviour returns to what it is today, rather than breaking.
+warnings.filterwarnings("error", message=r".*CUDA Graph is empty.*", category=UserWarning)
 
 # A replay still costs one host-side cudaGraphLaunch, a few microseconds that capture does not
 # remove -- it only removes the per-kernel dispatch inside the graph. When the whole graph is a
