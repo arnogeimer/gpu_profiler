@@ -285,7 +285,20 @@ GROUPNORM_SHAPES = [(16, 64, 56, 56, 32), (16, 128, 28, 28, 32),
 
 # rmsnorm shares layernorm's grid and layout -- one fewer reduction, and a weight but no bias --
 # but keeps its own kind, so the difference between them is measured rather than assumed.
-NORM_KINDS = ("batchnorm2d", "layernorm", "groupnorm", "rmsnorm")
+#
+# Included only where torch actually has it. nn.RMSNorm arrived in torch 2.4, and
+# F.rms_norm is NOT a fallback: the module and the functional landed together, so a version
+# missing one is missing both. Where it is absent the kind is dropped entirely rather than
+# emitting an error row per shape -- twelve rows reading "AttributeError: module 'torch.nn' has
+# no attribute 'RMSNorm'" describe the container, not the card, and would sit in the data looking
+# like a hardware failure while quietly making that GPU's row set differ from everyone else's.
+#
+# The fleet image pins torch 2.11, so every containerised node has it and the grid is uniform.
+# This only bites `python run.py` against an older local install, where the norm family returns
+# 30 rows instead of 42 -- visible in run.py's per-family line rather than hidden.
+_HAS_RMSNORM = hasattr(torch.nn, "RMSNorm")
+
+NORM_KINDS = ("batchnorm2d", "layernorm", "groupnorm") + (("rmsnorm",) if _HAS_RMSNORM else ())
 NORM_TIMING = (3, 5, 20)
 
 # (rows, width). The standalone softmax and reduction paths FX finds OUTSIDE SDPA; the attn family
