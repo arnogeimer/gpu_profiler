@@ -512,9 +512,14 @@ def _attn_point(bs: int, q_heads: int, kv_heads: int, seq_q: int, seq_kv: int,
     q = torch.randn(bs, q_heads, seq_q, head_dim, device="cuda", dtype=dt, requires_grad=grad)
     k = torch.randn(bs, kv_heads, seq_kv, head_dim, device="cuda", dtype=dt, requires_grad=grad)
     v = torch.randn(bs, kv_heads, seq_kv, head_dim, device="cuda", dtype=dt, requires_grad=grad)
-    gqa = q_heads != kv_heads
+    # enable_gqa is passed only when it is actually needed. It is newer than the rest of the SDPA
+    # signature, and spelling out enable_gqa=False -- which is the default anyway -- makes EVERY
+    # attn row fail with TypeError on a torch that predates the argument: rows describing the
+    # install rather than the card. Passing it only for genuine GQA shapes leaves the plain-MHA
+    # ones measuring normally there, and is byte-identical behaviour on a torch that has it.
+    kwargs = {"enable_gqa": True} if q_heads != kv_heads else {}
     fn = lambda: torch.nn.functional.scaled_dot_product_attention(
-        q, k, v, dropout_p=0.0, is_causal=causal, enable_gqa=gqa)
+        q, k, v, dropout_p=0.0, is_causal=causal, **kwargs)
     torch.cuda.synchronize()
     if grad:
         return fwd_bwd_fn(fn, [q, k, v], warm, rep, iters)
