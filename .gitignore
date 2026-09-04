@@ -13,6 +13,10 @@ wheels/
 # Docker (local-only deployment files, not part of the code)
 Dockerfile
 .dockerignore
+# ...except the probe node's. That folder is meant to be a self-contained, buildable unit -- its
+# Dockerfile IS the deployment, not a local convenience, and a clone without it cannot be built.
+!probe_node/Dockerfile
+!probe_node/.dockerignore
 
 # Generated outputs
 results/

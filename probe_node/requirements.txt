@@ -1,0 +1,16 @@
+# torch is pinned exactly, for the same reason it is pinned in the parent repo: probe rows are
+# collected across many nodes over weeks and must stay comparable, and cuDNN/cuBLAS/cutlass ship
+# inside the wheel -- a different build dispatches different kernels for the same shape. The
+# +cu130 wheels live on PyTorch's index.
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.11.0+cu130
+
+# torchvision, timm, transformers, peft, diffusers, accelerate, scipy and pillow are all absent
+# on purpose: they exist for the workload suite, and a probe dispatches nothing but raw aten ops.
+# Dropping them is most of the difference in image size between this node and the full one.
+
+# Support libraries. Floors rather than pins: none of them affect which kernels run, only how
+# results are gathered and written.
+huggingface-hub>=1.0
+nvidia-ml-py>=12.0
+pandas>=2.0
