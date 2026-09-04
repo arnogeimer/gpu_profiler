@@ -20,16 +20,23 @@ the image -- no torchvision, timm, transformers, peft or diffusers, none of whic
     HF_TOKEN     write token for the dataset repo. Unset -> the frame is written locally only.
     HF_REPO_ID   e.g. arge23/gpu-profiling-results
 
-Published per card:
+Published:
 
-    {gpu}/probes_{uuid}.csv        one row per (probe, dtype, size, direction, kind, causal)
-    {gpu}/probe_meta_{uuid}.json   host_info plus the sweep's `device` block -- torch/driver
-                                   versions and the clocks sampled DURING the sweep, which is
-                                   where throttling shows up and which the flat frame cannot
-                                   carry.
+    kernel_probes/{gpu}.csv             one file per GPU MODEL, one row per (probe, dtype, size,
+                                        direction, kind, causal) per card that has run it.
+    kernel_probes/meta/{gpu}_{uuid}.json
+                                        per card: host_info plus the sweep's `device` block --
+                                        torch/driver versions and the clocks sampled DURING the
+                                        sweep, which is where throttling shows up and which the
+                                        flat frame cannot carry.
 
-`uuid` is the physical card's NVML UUID (first 8 hex chars), stable across rentals, so repeated
-rentals of the same silicon overwrite rather than accumulate.
+One file per MODEL, not per card, so several cards of the same model accumulate into one table
+rather than overwriting each other -- `uuid` is a column, so which card produced a row is never
+lost. A card that runs twice replaces its OWN rows rather than duplicating them, which matters
+because anything taking a per-row median over a model would otherwise weight that card twice.
+
+`uuid` is the physical card's NVML UUID (first 8 hex chars), stable across rentals of the same
+silicon.
 
 NOTE ON THE ARTEFACT FORMAT. The fleet's older split JSONs (device_probe_{uuid}.json and
 probe_ext_v2_{uuid}.json) are NOT written here -- this publishes one frame instead. The
@@ -51,7 +58,8 @@ from pathlib import Path
 
 import pandas as pd
 import torch
-from huggingface_hub import upload_file
+from huggingface_hub import hf_hub_download, upload_file
+from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError
 
 import host_info
 import probes
@@ -71,6 +79,10 @@ BACKOFF_S = 5
 
 COLS = ["gpu", "uuid", "probe", "dtype", "size", "direction", "kind", "causal",
         "ms", "oom", "error"]
+
+# Where results land in the dataset repo. One CSV per GPU model at the top level, per-card
+# metadata beneath it.
+PROBE_DIR = "kernel_probes"
 
 
 def configure() -> None:
@@ -142,6 +154,38 @@ def publish(payload: bytes, path: str, token: str, repo_id: str) -> bool:
     return False
 
 
+def merge_prior(df: pd.DataFrame, gpu: str, uuid: str, token: str,
+                repo_id: str) -> pd.DataFrame | None:
+    """This model's published rows with this card's contribution folded in, or None to abort.
+
+    None means the existing file could not be READ -- a network failure, a rate limit, a
+    truncated download. Uploading this card's rows on top of that would replace every other
+    card's with nothing, so the caller publishes nothing at all instead. A file that simply does
+    not exist yet is a different answer, and returns df unchanged."""
+    try:
+        path = hf_hub_download(repo_id, f"{PROBE_DIR}/{gpu}.csv", repo_type="dataset",
+                               token=token)
+    except (EntryNotFoundError, RepositoryNotFoundError):
+        return df                                   # first card of this model
+    except Exception as e:
+        print(f"  cannot read the existing {PROBE_DIR}/{gpu}.csv "
+              f"({type(e).__name__}: {e}) — not publishing, rather than overwriting it")
+        return None
+
+    try:
+        prior = pd.read_csv(path)
+    except Exception as e:
+        print(f"  existing {PROBE_DIR}/{gpu}.csv is unreadable ({type(e).__name__}: {e}) "
+              f"— not publishing, rather than overwriting it")
+        return None
+
+    if "uuid" in prior.columns:
+        prior = prior[prior.uuid.astype(str) != str(uuid)]
+    n_cards = prior.uuid.nunique() if "uuid" in prior.columns else 0
+    print(f"  merging into {len(prior):,} existing rows from {n_cards} other card(s)")
+    return pd.concat([prior, df], ignore_index=True)
+
+
 def main() -> None:
     gpu, uuid = host_info.get_gpu_name(), host_info.get_gpu_uuid()
     print(f"GPU: {gpu}\nUUID: {uuid}")
@@ -172,9 +216,12 @@ def main() -> None:
 
     print()
     publish(json.dumps({"host": info, "device": device}, indent=2, default=str).encode("utf-8"),
-            f"{gpu}/probe_meta_{uuid}.json", token, repo_id)
-    publish(df.to_csv(index=False).encode("utf-8"),
-            f"{gpu}/probes_{uuid}.csv", token, repo_id)
+            f"{PROBE_DIR}/meta/{gpu}_{uuid}.json", token, repo_id)
+
+    merged = merge_prior(df, gpu, uuid, token, repo_id)
+    if merged is None:
+        return
+    publish(merged.to_csv(index=False).encode("utf-8"), f"{PROBE_DIR}/{gpu}.csv", token, repo_id)
 
 
 if __name__ == "__main__":

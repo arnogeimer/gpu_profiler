@@ -2,8 +2,8 @@
 
 """The hardware signature: every synthetic kernel this node times, in one file.
 
-Sixteen families, each swept over fp32/fp16/bf16, identified by (probe, dtype, size, direction,
-kind). Four groups, by what they are for rather than when they were added:
+Sixteen families, swept in fp32, identified by (probe, dtype, size, direction, kind). Four
+groups, by what they are for rather than when they were added:
 
   core          gemm, bmm, conv, attn, elementwise, pool, rnn
                 The shapes a step is mostly made of, sized to run on any card worth renting.
@@ -76,7 +76,17 @@ CORES_PER_SM = {(3, 0): 192, (3, 5): 192, (3, 7): 192,
 # repeats stays at 5 here while the workloads use 10: the probe is one atomic artefact
 # competing against container lifetime, and doubling it measurably cut how many nodes
 # produced one at all. The workloads can afford 10 because they checkpoint.
-DTYPES = {"fp16": torch.float16, "fp32": torch.float32, "bf16": torch.bfloat16}
+# fp32 only. The mixed-precision dtypes were dropped deliberately, not for cost: on a probe
+# they measure the tensor cores and the cast machinery as much as the kernel, and which of the
+# two dominates moves with the shape -- so an fp16 row is a blend whose mixture is not a property
+# of the hardware. fp32 is one path through the SM for every family here, which is what makes a
+# row comparable between shapes and between cards.
+#
+# Widening this back out is a one-line change and every family already sweeps whatever is in it;
+# nothing below assumes a single dtype. But rows collected under a widened DTYPES are not
+# comparable with rows collected under this one at the same (probe, size) -- the dtype is part of
+# the row key precisely so that mixing them is visible rather than silent.
+DTYPES = {"fp32": torch.float32}
 
 # (N, K) hidden dims x an M ladder. The workloads never dispatch a square matmul: N and K
 # are model hidden dims while M is the token count (batch x seq, or batch x H x W), and
@@ -954,11 +964,11 @@ def probe_optimizer(rows: list, dt: torch.dtype, name: str) -> None:
     """SGD's two per-step costs over a persistent parameter set. No direction -- neither is a
     forward or a backward, so both are recorded as fwd.
 
-    fp32 ONLY, and skipped under the other two dtypes rather than repeated beneath a different
-    label. The parameters an optimizer owns stay fp32 whatever the autocast dtype of the step
-    that produced their gradients, so an fp16 or bf16 row here would name a configuration
-    nothing runs -- and cost three times the sweep to say it. Adam is deliberately absent: the
-    workloads use SGD with momentum."""
+    fp32 regardless of what DTYPES holds: the parameters an optimizer owns stay fp32 whatever the
+    autocast dtype of the step that produced their gradients, so a row in any other dtype would
+    name a configuration nothing runs. The guard is redundant while DTYPES is fp32-only and is
+    kept because it is a property of the optimizer, not of the current sweep. Adam is
+    deliberately absent: the workloads use SGD with momentum."""
     if dt is not torch.float32:
         return
     warm, rep, iters = OPTIMIZER_TIMING
